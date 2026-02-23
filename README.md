@@ -1,1 +1,23 @@
-# backend
+# YouTube Intelligence Platform - Backend
+
+## Current Progress/Workflow
+Built the data ingestion pipeline that pulls YouTube video metadata and transcripts. The flow is:
+
+1. **Fetch metadata** - Query YouTube Data API to search for videos
+2. **Extract transcripts** - Pull the transcript for each video using the YouTube Transcript API
+3. **Clean transcripts** - Process raw transcripts to remove noise (speaker tags, sound effects, filler words) and normalize formatting
+4. **Store locally** - Save both raw and cleaned versions to the `data/` folder for now
+
+Eventually this data moves to Supabase, but we're keeping it local for development.
+
+## Getting started
+1. Go to Google Console >> Get an API key for YouTube Data API
+2. Initialize a `.env` file with `YOUTUBE_DATA_API_KEY` set up. 
+3. Run the notebook (`yt-data-ingestion.ipynb`) to see the full pipeline in action.
+
+## Setup
+1. Create a designated virtual env (either via Python natively or Anaconda) and activate it. 
+2. Install the following packages/libraries using the following command:
+    ```bash
+    pip install google-api-python-client youtube-transcript-api python-dotenv
+    ```
