@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     SUPABASE_ANON_KEY: str = ""
     SUPABASE_SERVICE_ROLE_KEY: str = ""
 
+    DATABASE_URL: str = ""
+
     class Config:
         env_file = ".env"
 
