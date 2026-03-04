@@ -1,0 +1,2 @@
+# LLM Insight Generation pipeline
+requests>=2.28.0
