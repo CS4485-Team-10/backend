@@ -1,2 +1,13 @@
-# LLM Insight Generation pipeline
 requests>=2.28.0
+alembic==1.18.4
+annotated-types==0.7.0
+greenlet==3.3.2
+Mako==1.3.10
+MarkupSafe==3.0.3
+psycopg2-binary==2.9.11
+pydantic==2.12.5
+pydantic_core==2.41.5
+SQLAlchemy==2.0.47
+sqlmodel==0.0.37
+typing-inspection==0.4.2
+typing_extensions==4.15.0

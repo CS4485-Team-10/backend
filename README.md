@@ -1,28 +1,50 @@
-# YouTube Intelligence Platform - Backend
+# YouTube Intelligence Platform — Backend
+## Setup
 
-## Current Progress/Workflow
-Built the data ingestion pipeline that pulls YouTube video metadata and transcripts. The flow is:
+```bash
+uv venv .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+cp .env.example .env  # fill in your Supabase credentials
+```
 
-1. **Fetch metadata** - Query YouTube Data API to search for videos
-2. **Extract transcripts** - Pull the transcript for each video using the YouTube Transcript API
-3. **Clean transcripts** - Process raw transcripts to remove noise (speaker tags, sound effects, filler words) and normalize formatting
-4. **Store locally** - Save both raw and cleaned versions to the `data/` folder for now
+## Database Migrations (Alembic)
 
-Eventually this data moves to Supabase, but we're keeping it local for development.
+Migrations live in `alembic/versions/`. The database URL is read from `DATABASE_URL` in `.env`.
 
-## Getting started
+```bash
+# Apply all pending migrations
+uv run alembic upgrade head
+
+# Generate a new migration after changing models in app/models/
+uv run alembic revision --autogenerate -m "describe your change"
+
+# Check current migration version
+uv run alembic current
+
+# Rollback the last migration
+uv run alembic downgrade -1
+```
+
+## Run the server
+
+```bash
+uv run uvicorn app.main:app --reload
+```
+
+## Data Ingestion Pipeline
+
+### Setup
 1. Go to Google Console >> Get an API key for YouTube Data API
 2. Initialize a `.env` file with `YOUTUBE_DATA_API_KEY` set up. 
-3. Run the notebook (`yt-data-ingestion.ipynb`) to see the full pipeline in action.
-
-## Setup
-1. Create a designated virtual env (either via Python natively or Anaconda) and activate it. 
-2. Install the following packages/libraries using the following command:
+3. Create a designated virtual env (either via Python natively or Anaconda) and activate it. 
+4. Install the following packages/libraries using the following command:
     ```bash
     pip install google-api-python-client youtube-transcript-api python-dotenv
     ```
+5. Run the notebook (`yt-data-ingestion.ipynb`) to see the full pipeline in action.
 
-## LLM Insight Generation (Claims Extraction)
+### LLM Insight Generation (Claims Extraction)
 
 The `llm_insight_generation.ipynb` notebook extracts claims from cleaned transcripts using Ollama.
 
