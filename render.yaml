@@ -2,7 +2,7 @@ services:
   - type: web
     name: fastapi-backend
     runtime: python
-    region: oregon   # options: oregon, ohio, virginia, frankfurt, singapore
+    region: oregon
     plan: free
 
     branch: main

@@ -1,5 +1,6 @@
 alembic==1.18.4
 annotated-types==0.7.0
+fastapi==0.115.14
 greenlet==3.3.2
 Mako==1.3.10
 MarkupSafe==3.0.3
@@ -10,3 +11,4 @@ SQLAlchemy==2.0.47
 sqlmodel==0.0.37
 typing-inspection==0.4.2
 typing_extensions==4.15.0
+uvicorn[standard]==0.34.3
