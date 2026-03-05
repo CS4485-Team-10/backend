@@ -15,7 +15,8 @@ def supabase_ping():
         supabase = create_client(
             settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY
         )
-        # Simple query: use a table you have (e.g. videos). Create it in Supabase if missing.
+        # Simple query: use a table you have (e.g. videos).
+        # Create it in Supabase if missing.
         res = supabase.table("videos").select("video_id").limit(1).execute()
         return {"ok": True, "data": res.data}
     except Exception as e:
