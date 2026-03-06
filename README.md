@@ -26,6 +26,15 @@ uv run alembic current
 uv run alembic downgrade -1
 ```
 
+## Pre-commit Hooks
+
+Install pre-commit to enable automatic linting and formatting on every commit:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
 ## Run the server
 
 ```bash
