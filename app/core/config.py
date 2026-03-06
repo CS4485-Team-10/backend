@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     SUPABASE_URL: str = ""
     SUPABASE_ANON_KEY: str = ""
     SUPABASE_SERVICE_ROLE_KEY: str = ""
+    DATABASE_URL: str = ""
 
     YOUTUBE_API_KEY: str = ""
     # DS notebook uses YOUTUBE_DATA_API_KEY; either key can be used for ingestion
