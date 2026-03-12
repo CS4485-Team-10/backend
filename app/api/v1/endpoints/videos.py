@@ -1,42 +1,59 @@
-# Transcript retrieval routes for data pipeline. Response shape will align with final schema when set.
-from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from supabase import create_client
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlmodel import Session, select, func
 
-from app.core.config import settings
+from app.core.database import get_session
+from app.models.channel import Channel
+from app.models.video import Video
+from app.schemas.video import VideoWithChannel
 
 router = APIRouter()
 
 
-class VideoWithTranscript(BaseModel):
-    video_id: str
-    transcript: Optional[str] = None
-    title: Optional[str] = None
-    created_at: Optional[datetime] = None
-
-
 @router.get("/videos")
-def list_videos():
-    if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_ROLE_KEY:
-        return {"error": "Supabase env vars not set"}
-    supabase = create_client(
-        settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY
+def list_videos(
+    channel_id: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    session: Session = Depends(get_session),
+):
+    statement = select(Video, Channel.title, Channel.handle).join(
+        Channel, Video.channel_id == Channel.channel_id
     )
-    res = supabase.table("videos").select("*").execute()
-    return {"ok": True, "data": res.data, "count": len(res.data)}
+    if channel_id:
+        statement = statement.where(Video.channel_id == channel_id)
+
+    count_stmt = select(func.count()).select_from(Video)
+    if channel_id:
+        count_stmt = count_stmt.where(Video.channel_id == channel_id)
+    total = session.exec(count_stmt).one()
+
+    results = session.exec(statement.offset(skip).limit(limit)).all()
+    data = [
+        VideoWithChannel(
+            **video.model_dump(),
+            channel_title=ch_title,
+            channel_handle=ch_handle,
+        )
+        for video, ch_title, ch_handle in results
+    ]
+    return {"ok": True, "data": data, "count": total}
 
 
-@router.get("/videos/{video_id}", response_model=VideoWithTranscript)
-def get_video(video_id: str):
-    if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase env vars not set")
-    supabase = create_client(
-        settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY
-    )
-    res = supabase.table("videos").select("*").eq("video_id", video_id).execute()
-    if not res.data:
+@router.get("/videos/{video_id}")
+def get_video(video_id: str, session: Session = Depends(get_session)):
+    result = session.exec(
+        select(Video, Channel.title, Channel.handle)
+        .join(Channel, Video.channel_id == Channel.channel_id)
+        .where(Video.video_id == video_id)
+    ).first()
+    if not result:
         raise HTTPException(status_code=404, detail="Video not found")
-    return res.data[0]
+    video, ch_title, ch_handle = result
+    data = VideoWithChannel(
+        **video.model_dump(),
+        channel_title=ch_title,
+        channel_handle=ch_handle,
+    )
+    return {"ok": True, "data": data}
