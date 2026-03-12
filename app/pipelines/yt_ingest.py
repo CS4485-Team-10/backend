@@ -1,5 +1,6 @@
 # YouTube data ingestion pipeline — extracted from yt_data_ingestion.ipynb (DS team).
-# Fetches video metadata (YouTube Data API), channel metadata, and transcript; cleans transcript per notebook.
+# Fetches video metadata (YouTube Data API), channel metadata,
+# and transcript; cleans transcript per notebook.
 from __future__ import annotations
 
 import re
@@ -18,7 +19,10 @@ YOUTUBE_CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
 
 
 def fetch_video_metadata(api_key: str, video_id: str) -> dict[str, Any]:
-    """Get hydrated video metadata (snippet, statistics, contentDetails). Matches notebook fetch_video_metadata."""
+    """Get hydrated video metadata (snippet, statistics, contentDetails).
+
+    Matches notebook fetch_video_metadata.
+    """
     params = {
         "part": "snippet,statistics,contentDetails",
         "id": video_id,
@@ -45,7 +49,11 @@ def fetch_channel_metadata(api_key: str, channel_id: str) -> dict[str, Any]:
     resp.raise_for_status()
     data = resp.json()
     if not data.get("items"):
-        return {"title": "", "handle": "", "url": f"https://www.youtube.com/channel/{channel_id}"}
+        return {
+            "title": "",
+            "handle": "",
+            "url": f"https://www.youtube.com/channel/{channel_id}",
+        }
     sn = data["items"][0].get("snippet", {})
     return {
         "title": sn.get("title", ""),
@@ -80,7 +88,10 @@ def clean_transcript(transcript_data: list[dict[str, Any]]) -> str:
 
 
 def fetch_transcript(video_id: str) -> tuple[str, str]:
-    """Fetch transcript and return (cleaned_text, language). Raises transcript-api errors."""
+    """Fetch transcript and return (cleaned_text, language).
+
+    Raises transcript-api errors.
+    """
     raw = YouTubeTranscriptApi.get_transcript(video_id)
     cleaned = clean_transcript(raw)
     return cleaned, "en"
@@ -88,7 +99,9 @@ def fetch_transcript(video_id: str) -> tuple[str, str]:
 
 def run_pipeline(api_key: str, video_id: str) -> dict[str, Any]:
     """
-    Run the DS ingestion pipeline for one video: fetch video + channel + transcript (cleaned).
+    Run the DS ingestion pipeline for one video.
+
+    Fetch video + channel + transcript (cleaned).
     Returns payload for backend to write to Supabase (channels, videos, transcripts).
     """
     video_resource = fetch_video_metadata(api_key, video_id)
@@ -103,7 +116,9 @@ def run_pipeline(api_key: str, video_id: str) -> dict[str, Any]:
 
     published_at = snippet.get("publishedAt")
     thumbnails = snippet.get("thumbnails", {}) or {}
-    thumb_url = (thumbnails.get("default") or thumbnails.get("medium") or {}).get("url") or ""
+    thumb_url = (thumbnails.get("default") or thumbnails.get("medium") or {}).get(
+        "url"
+    ) or ""
     view_count = int(statistics.get("viewCount", 0) or 0)
 
     return {
