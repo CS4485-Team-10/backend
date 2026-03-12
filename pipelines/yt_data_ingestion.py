@@ -2,8 +2,10 @@
 YouTube Data Ingestion Pipeline.
 
 1. Pull official YouTube metadata via Google's YouTube Data API
-2. Pull transcripts via youtube-transcript-api
-3. Pull comments via YouTube Data API
+2. Semantic filter by public health relevance (LLM-based)
+3. Filter by metadata impact
+4. Pull transcripts via youtube-transcript-api
+5. Pull comments via YouTube Data API
 """
 
 import json
@@ -13,12 +15,15 @@ import re
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.formatters import JSONFormatter
+
+from pipelines.llm_insight_generation import OllamaProvider
+from pipelines.shared import LLMProvider
 
 # Resolve to backend/data (works when run from backend/ or pipelines/)
 DATA_ROOT = (
@@ -149,6 +154,136 @@ def _clean_transcript(transcript_data: Union[List[Dict], str]) -> str:
     if text and text[0].islower():
         text = text[0].upper() + text[1:]
     return text
+
+
+_SEMANTIC_FILTER_SYSTEM = """You classify YouTube video titles for relevance to PUBLIC HEALTH as a domain.
+
+PUBLIC HEALTH means: population-level health, disease outbreaks, vaccination, epidemiology, nutrition as a population issue, maternal health, environmental health, mental health at community/population level, health policy, public health education, misinformation around treatments/prevention/disease/population health.
+
+EXCLUDE (filter out):
+- Athlete injury gossip, sports health updates
+- Celebrity illness news unless clearly tied to broader public health discussion
+- Vague religious/spiritual healing unless directly framed as public-health-relevant
+- Random wellness clickbait not actually relevant to public health topics
+
+Return ONLY valid JSON. For each video, output: {"video_id": "...", "is_relevant": true|false, "reason": "short string", "confidence": 0.0-1.0}"""
+
+
+def _get_llm_provider_for_filtering() -> LLMProvider:
+    """Create LLM provider for semantic filtering from env vars."""
+    model = os.environ.get("LLM_MODEL", "llama3")
+    return OllamaProvider(model=model)
+
+
+def _parse_semantic_filter_response(
+    raw: str, video_ids: List[str]
+) -> Dict[str, dict]:
+    """
+    Parse LLM classification response. Returns dict mapping video_id -> {is_relevant, reason, confidence}.
+    Fails closed: malformed or missing entries are treated as not relevant.
+    """
+    result: Dict[str, dict] = {}
+    text = raw.strip()
+    if "```" in text:
+        for marker in ("```json", "```"):
+            if marker in text:
+                start = text.find(marker) + len(marker)
+                end = text.find("```", start)
+                text = text[start : end if end >= 0 else None].strip()
+                break
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return result
+
+    items = parsed if isinstance(parsed, list) else parsed.get("results", parsed.get("items", []))
+    if not isinstance(items, list):
+        return result
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        vid = item.get("video_id")
+        if not vid or vid not in video_ids:
+            continue
+        is_rel = item.get("is_relevant", False)
+        if not isinstance(is_rel, bool):
+            is_rel = str(is_rel).lower() in ("true", "1", "yes")
+        try:
+            conf = float(item.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        result[vid] = {
+            "is_relevant": is_rel,
+            "reason": str(item.get("reason", ""))[:200],
+            "confidence": conf,
+        }
+    return result
+
+
+def filter_videos_by_public_health_relevance(
+    video_metadata: List[dict],
+    provider: Optional[LLMProvider] = None,
+    *,
+    batch_size: int = 15,
+    min_confidence: float = 0.5,
+    verbose: bool = True,
+) -> List[dict]:
+    """
+    Filter candidate videos by semantic relevance to public health.
+
+    Uses an LLM to classify each video's title (and optionally description).
+    Returns only metadata for videos classified as relevant with sufficient confidence.
+    Fails closed: malformed responses or parse errors exclude the affected videos.
+    """
+    if not video_metadata:
+        return []
+
+    prov = provider or _get_llm_provider_for_filtering()
+    kept: List[dict] = []
+    video_by_id = {v["id"]: v for v in video_metadata}
+
+    for i in range(0, len(video_metadata), batch_size):
+        batch = video_metadata[i : i + batch_size]
+        batch_ids = [v["id"] for v in batch]
+        titles = [
+            v.get("snippet", {}).get("title", "")[:200] or "(no title)"
+            for v in batch
+        ]
+        descriptions = [
+            (v.get("snippet", {}).get("description", "") or "")[:300]
+            for v in batch
+        ]
+
+        user_prompt = "Classify each video for public health relevance. Return a JSON array.\n\n"
+        for j, (vid, title, desc) in enumerate(zip(batch_ids, titles, descriptions)):
+            user_prompt += f"{j+1}. video_id: {vid}\n   title: {title}\n"
+            if desc:
+                user_prompt += f"   description: {desc[:150]}...\n" if len(desc) > 150 else f"   description: {desc}\n"
+            user_prompt += "\n"
+
+        user_prompt += '\nReturn JSON array: [{"video_id":"...","is_relevant":bool,"reason":"...","confidence":0.0-1.0}, ...]'
+
+        try:
+            raw = prov.generate_response(
+                system=_SEMANTIC_FILTER_SYSTEM, user_prompt=user_prompt
+            )
+            classifications = _parse_semantic_filter_response(raw, batch_ids)
+            for vid in batch_ids:
+                c = classifications.get(vid)
+                if c and c.get("is_relevant") and c.get("confidence", 0) >= min_confidence:
+                    kept.append(video_by_id[vid])
+                elif verbose:
+                    reason = c.get("reason", "no classification") if c else "parse skipped"
+                    print(f"  [filtered] {vid}: {reason[:80]}")
+        except Exception as e:
+            if verbose:
+                print(f"  [semantic filter batch error] {e}")
+            for vid in batch_ids:
+                if verbose:
+                    print(f"  [filtered] {vid}: batch failed (fail closed)")
+
+    return kept
 
 
 def _fetch_candidate_video_ids(
@@ -306,7 +441,16 @@ def run_youtube_data_ingestion_pipeline(
     video_ids = _fetch_candidate_video_ids(
         youtube, search_query=search_query, max_search_pages=max_search_pages
     )
+    if verbose:
+        print(f"Search results: {len(video_ids)} candidates")
+
     video_metadata = _fetch_video_metadata(youtube, video_ids)
+    video_metadata = filter_videos_by_public_health_relevance(
+        video_metadata, verbose=verbose
+    )
+    if verbose:
+        print(f"After semantic filter: {len(video_metadata)} public-health-relevant")
+
     filtered_ids = _filter_by_impact(
         video_metadata,
         min_comments_per_1k=min_comments_per_1k,
@@ -314,9 +458,8 @@ def run_youtube_data_ingestion_pipeline(
         min_views=min_views,
         percentile=percentile,
     )
-
     if verbose:
-        print(f"Candidates: {len(video_ids)}, Filtered: {len(filtered_ids)}")
+        print(f"After impact filter: {len(filtered_ids)} high-impact")
 
     formatter = JSONFormatter()
     transcripts_saved = _save_transcripts(
