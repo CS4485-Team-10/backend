@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlmodel import Session, select, func
+from sqlmodel import Session, func, select
 
 from app.core.database import get_session
 from app.models.channel import Channel

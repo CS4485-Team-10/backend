@@ -3,10 +3,9 @@ from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from sqlmodel import SQLModel
 
-from alembic import context
-
-from app.core.config import settings
 import app.models  # noqa: F401 – registers all models
+from alembic import context
+from app.core.config import settings
 
 config = context.config
 
@@ -22,9 +21,7 @@ EXCLUDE_TABLES = {"jobs", "trend_points"}
 
 
 def include_object(object, name, type_, reflected, compare_to):
-    if type_ == "table" and name in EXCLUDE_TABLES:
-        return False
-    return True
+    return not (type_ == "table" and name in EXCLUDE_TABLES)
 
 
 def run_migrations_offline() -> None:

@@ -1,5 +1,4 @@
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 from sqlmodel import Field, SQLModel
 
@@ -11,4 +10,4 @@ class Channel(SQLModel, table=True):
     title: str
     handle: str
     url: str
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

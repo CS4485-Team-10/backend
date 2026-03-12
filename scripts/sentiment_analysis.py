@@ -1,20 +1,19 @@
-import os
-import sys
-import re
 import json
 import logging
+import os
+import re
+import sys
 from pathlib import Path
-from datetime import datetime, timezone
 
-from youtube_transcript_api import YouTubeTranscriptApi
 from dotenv import load_dotenv
+from youtube_transcript_api import YouTubeTranscriptApi
 
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("torch").setLevel(logging.ERROR)
 
-from transformers import pipeline
+from transformers import pipeline  # noqa: E402
 
 load_dotenv(Path(__file__).resolve().parent / ".env.example")
 
@@ -31,22 +30,27 @@ sentiment_analyzer = pipeline(
 
 ytt_api = YouTubeTranscriptApi()
 
+
 def clean_transcript(transcript) -> str:
     text = " ".join([snippet.text for snippet in transcript.snippets])
-    text = re.sub(r'\[[^\\]]*\]', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\([^)]*\)', '', text)
-    for pattern in [r'\b(?:um|uh|ugh|hmm)\b', r'\byou\s+know\b']:
-        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r"\[[^\\]]*\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\([^)]*\)", "", text)
+    for pattern in [r"\b(?:um|uh|ugh|hmm)\b", r"\byou\s+know\b"]:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
+
 def chunk_text(text: str, chunk_size: int = 300) -> list:
-    #Splits the text into chunks of 300 words
+    # Splits the text into chunks of 300 words
     words = text.split()
-    return [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+    return [
+        " ".join(words[i : i + chunk_size]) for i in range(0, len(words), chunk_size)
+    ]
+
 
 def analyze_video_sentiment(video_id: str) -> dict:
-    #Fetch -> Clean -> Chunk -> Analyze -> Aggregate
+    # Fetch -> Clean -> Chunk -> Analyze -> Aggregate
     try:
         # Fetch transcript using v1.x API
         try:
@@ -54,46 +58,49 @@ def analyze_video_sentiment(video_id: str) -> dict:
         except Exception:
             # If English isn't available, grab whatever language exists
             transcript = ytt_api.fetch(video_id)
-        
+
         # Clean transcript
         cleaned_text = clean_transcript(transcript)
-        
+
         # Chunk text
         chunks = chunk_text(cleaned_text)
-        
+
         if not chunks:
             return {"error": "Transcript is empty after cleaning."}
 
         # Analyze sentiment for each chunk
         chunk_results = sentiment_analyzer(chunks)
-        
+
         # Aggregate the results
         total_score = 0
         positive_chunks = 0
         negative_chunks = 0
-        
+
         for result in chunk_results:
             # The model returns labels 'POSITIVE' or 'NEGATIVE' with a confidence score
-            if result['label'] == 'POSITIVE':
+            if result["label"] == "POSITIVE":
                 positive_chunks += 1
-                total_score += result['score'] # Add confidence
+                total_score += result["score"]  # Add confidence
             else:
-                # Subtract confidence for negative chunks to reflect their impact on overall sentiment
+                # Subtract confidence for negative chunks
+                # to reflect their impact on overall sentiment
                 negative_chunks += 1
-                total_score -= result['score']
-        
-        #Calculate sentiment
+                total_score -= result["score"]
+
+        # Calculate sentiment
         avg_score = total_score / len(chunks)
         overall_sentiment = "POSITIVE" if avg_score > 0 else "NEGATIVE"
-        
+
         return {
             "video_id": video_id,
             "overall_sentiment": overall_sentiment,
-            "sentiment_score": round(avg_score, 4), # Range from -1.0 (Highly Negative) to 1.0 (Highly Positive)
+            "sentiment_score": round(
+                avg_score, 4
+            ),  # Range from -1.0 (Highly Negative) to 1.0 (Highly Positive)
             "total_chunks": len(chunks),
             "positive_chunks": positive_chunks,
             "negative_chunks": negative_chunks,
-            "timeline": chunk_results # Contains the sequential sentiment of the video
+            "timeline": chunk_results,  # Contains the sequential sentiment of the video
         }
 
     except Exception as e:
@@ -114,6 +121,7 @@ def ids_from_file(filepath: str) -> list[str]:
             ids.append(line)
     return ids
 
+
 def print_result(result: dict):
     """Print only the important stuff."""
     if "error" in result:
@@ -131,8 +139,10 @@ def print_result(result: dict):
 # SUPABASE HELPERS
 # ----------------------------------------------
 
+
 def get_supabase_client():
     from supabase import create_client
+
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("Error: SUPABASE_URL / SUPABASE_KEY not set.")
         sys.exit(1)
@@ -160,14 +170,18 @@ def ids_from_supabase_without_sentiment() -> list[str]:
     done_ids = {r["video_id"] for r in existing.data}
 
     remaining = list(all_ids - done_ids)
-    print(f"  {len(all_ids)} total videos, {len(done_ids)} already analyzed, {len(remaining)} remaining")
+    print(
+        f"  {len(all_ids)} total videos, {len(done_ids)} already analyzed, "
+        f"{len(remaining)} remaining"
+    )
     return remaining
 
 
 def push_sentiment_to_supabase(result: dict):
     """
     Push a sentiment analysis result into the insights table.
-    Maps to: video_id, model='sentiment', labels, confidence, claims (timeline), created_at
+    Maps to: video_id, model='sentiment', labels, confidence,
+    claims (timeline), created_at
     """
     if "error" in result:
         return
@@ -179,17 +193,19 @@ def push_sentiment_to_supabase(result: dict):
         "model": "sentiment",
         "claims": json.dumps([]),  # not applicable for sentiment
         "narratives": json.dumps([]),  # not applicable for sentiment
-        "labels": json.dumps({
-            "overall_sentiment": result["overall_sentiment"],
-            "positive_chunks": result["positive_chunks"],
-            "negative_chunks": result["negative_chunks"],
-            "total_chunks": result["total_chunks"],
-            "timeline": result["timeline"],
-        }),
+        "labels": json.dumps(
+            {
+                "overall_sentiment": result["overall_sentiment"],
+                "positive_chunks": result["positive_chunks"],
+                "negative_chunks": result["negative_chunks"],
+                "total_chunks": result["total_chunks"],
+                "timeline": result["timeline"],
+            }
+        ),
         "confidence": abs(result["sentiment_score"]),  # 0-1 confidence
     }
 
-    resp = client.table(SUPABASE_TABLE_INSIGHTS).insert(row).execute()
+    client.table(SUPABASE_TABLE_INSIGHTS).insert(row).execute()
     print(f"    [OK] Pushed sentiment for {result['video_id']} to Supabase")
 
 
@@ -241,7 +257,10 @@ if __name__ == "__main__":
     if successes:
         avg = sum(r["sentiment_score"] for r in successes) / len(successes)
         print(f"\n{'-' * 50}")
-        print(f"Total: {len(all_results)} videos  |  Analyzed: {len(successes)}  |  Failed: {failures}")
+        print(
+            f"Total: {len(all_results)} videos  |"
+            f"  Analyzed: {len(successes)}  |  Failed: {failures}"
+        )
         print(f"Average sentiment score: {avg:+.4f}")
     else:
         print(f"\nNo videos could be analyzed ({failures} failed).")

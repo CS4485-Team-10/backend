@@ -1,4 +1,3 @@
-
 import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -33,11 +32,13 @@ def ingest_video(payload: IngestVideoRequest):
     try:
         payload = run_pipeline(api_key, video_id)
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail="YouTube API error")
+        raise HTTPException(
+            status_code=e.response.status_code, detail="YouTube API error"
+        ) from e
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except TranscriptErrors as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e)) from e
 
     sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
     channel_id = payload["channel"]["channel_id"]
@@ -54,7 +55,8 @@ def ingest_video(payload: IngestVideoRequest):
         on_conflict="video_id",
     ).execute()
 
-    # 3. Transcript: delete then insert (idempotent re-run; notebook had placeholder for DB store)
+    # 3. Transcript: delete then insert
+    # (idempotent re-run; notebook had placeholder for DB store)
     sb.table("transcripts").delete().eq("video_id", video_id).execute()
     sb.table("transcripts").insert(payload["transcript"]).execute()
 

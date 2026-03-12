@@ -14,12 +14,11 @@ Usage:
     python comment_sentiment.py <VIDEO_ID1> <VIDEO_ID2>  -> multiple videos
 """
 
-import os
-import sys
 import json
 import logging
+import os
+import sys
 from pathlib import Path
-from collections import Counter
 
 from dotenv import load_dotenv
 
@@ -28,7 +27,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("torch").setLevel(logging.ERROR)
 
-from transformers import pipeline
+from transformers import pipeline  # noqa: E402
 
 load_dotenv(Path(__file__).resolve().parent / ".env.example", override=True)
 
@@ -46,6 +45,7 @@ print("Model loaded.\n")
 # ──────────────────────────────────────────────
 # YOUTUBE COMMENTS FETCHER
 # ──────────────────────────────────────────────
+
 
 def fetch_comments(video_id: str, max_comments: int = 100) -> list[dict]:
     """
@@ -86,12 +86,14 @@ def fetch_comments(video_id: str, max_comments: int = 100) -> list[dict]:
 
         for item in response.get("items", []):
             snippet = item["snippet"]["topLevelComment"]["snippet"]
-            comments.append({
-                "author": snippet.get("authorDisplayName", "Unknown"),
-                "text": snippet.get("textDisplay", ""),
-                "likes": snippet.get("likeCount", 0),
-                "published_at": snippet.get("publishedAt", ""),
-            })
+            comments.append(
+                {
+                    "author": snippet.get("authorDisplayName", "Unknown"),
+                    "text": snippet.get("textDisplay", ""),
+                    "likes": snippet.get("likeCount", 0),
+                    "published_at": snippet.get("publishedAt", ""),
+                }
+            )
 
         next_page_token = response.get("nextPageToken")
         if not next_page_token:
@@ -99,8 +101,10 @@ def fetch_comments(video_id: str, max_comments: int = 100) -> list[dict]:
 
     return comments
 
+
 # ──────────────────────────────────────────────
 # SENTIMENT ANALYSIS ON COMMENTS
+
 
 def analyze_comment_sentiment(comments: list[dict]) -> dict:
     """
@@ -124,23 +128,25 @@ def analyze_comment_sentiment(comments: list[dict]) -> dict:
     # Attach results back to comments
     detailed = []
     for i, (comment, result) in enumerate(zip(comments, results)):
-        detailed.append({
-            "author": comment["author"],
-            "text": comment["text"][:200],  # truncate for display
-            "likes": comment["likes"],
-            "sentiment": result["label"],
-            "confidence": round(result["score"], 4),
-        })
+        detailed.append(
+            {
+                "author": comment["author"],
+                "text": comment["text"][:200],  # truncate for display
+                "likes": comment["likes"],
+                "sentiment": result["label"],
+                "confidence": round(result["score"], 4),
+            }
+        )
 
     # Aggregate
     positive = sum(1 for r in results if r["label"] == "POSITIVE")
     negative = sum(1 for r in results if r["label"] == "NEGATIVE")
     total = len(results)
 
-    avg_score = sum(
-        r["score"] if r["label"] == "POSITIVE" else -r["score"]
-        for r in results
-    ) / total
+    avg_score = (
+        sum(r["score"] if r["label"] == "POSITIVE" else -r["score"] for r in results)
+        / total
+    )
 
     # Top positive and negative comments (by confidence)
     sorted_positive = sorted(
@@ -172,6 +178,7 @@ def analyze_comment_sentiment(comments: list[dict]) -> dict:
 # PRETTY PRINT
 # ──────────────────────────────────────────────
 
+
 def print_comment_analysis(video_id: str, analysis: dict):
     print(f"\n{'=' * 60}")
     print(f"  COMMENT SENTIMENT -- {video_id}")
@@ -184,19 +191,24 @@ def print_comment_analysis(video_id: str, analysis: dict):
     label = analysis["overall_sentiment"]
     icon = "[+]" if label == "POSITIVE" else "[-]"
 
-    print(f"  Overall: {icon} {label}  (score: {analysis['avg_sentiment_score']:+.4f})")
-    print(f"  Comments: {analysis['total_comments']}  "
-          f"| pos: {analysis['positive_count']} ({analysis['positive_pct']}%)  "
-          f"| neg: {analysis['negative_count']} ({analysis['negative_pct']}%)")
+    print(
+        f"  Overall: {icon} {label}"
+        f"  (score: {analysis['avg_sentiment_score']:+.4f})"
+    )
+    print(
+        f"  Comments: {analysis['total_comments']}  "
+        f"| pos: {analysis['positive_count']} ({analysis['positive_pct']}%)  "
+        f"| neg: {analysis['negative_count']} ({analysis['negative_pct']}%)"
+    )
 
     if analysis["top_positive"]:
-        print(f"\n  Top Positive Comments:")
+        print("\n  Top Positive Comments:")
         for c in analysis["top_positive"]:
             print(f"    [+] [{c['confidence']:.0%}] {c['text'][:100]}...")
             print(f"       -- {c['author']} (likes: {c['likes']})")
 
     if analysis["top_negative"]:
-        print(f"\n  Top Negative Comments:")
+        print("\n  Top Negative Comments:")
         for c in analysis["top_negative"]:
             print(f"    [-] [{c['confidence']:.0%}] {c['text'][:100]}...")
             print(f"       -- {c['author']} (likes: {c['likes']})")
@@ -225,7 +237,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         skip = {max_idx, max_idx + 1} if max_idx >= 0 else set()
         video_ids = [
-            v for i, v in enumerate(sys.argv)
+            v
+            for i, v in enumerate(sys.argv)
             if i > 0 and i not in skip and not v.startswith("--")
         ]
     else:
@@ -234,7 +247,9 @@ if __name__ == "__main__":
     if not video_ids:
         video_ids = DEFAULT_TEST_VIDEOS
 
-    print(f"Fetching up to {max_comments} comments per video for {len(video_ids)} video(s)...\n")
+    print(
+        f"Fetching up to {max_comments} comments per video for {len(video_ids)} video(s)...\n"
+    )
 
     all_analyses = {}
 
@@ -244,13 +259,13 @@ if __name__ == "__main__":
         print(f"  Got {len(comments)} comments")
 
         if comments:
-            print(f"  Running sentiment analysis...")
+            print("  Running sentiment analysis...")
             analysis = analyze_comment_sentiment(comments)
             all_analyses[vid] = analysis
             print_comment_analysis(vid, analysis)
         else:
             all_analyses[vid] = {"error": "No comments fetched"}
-            print(f"  [!] No comments to analyze\n")
+            print("  [!] No comments to analyze\n")
 
     # Save raw results to JSON for inspection
     output_path = Path(__file__).resolve().parent / "comment_sentiment_results.json"

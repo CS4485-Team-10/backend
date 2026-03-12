@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Get staged Python files (exclude pipelines/ and scripts/)
+STAGED_PY_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$' | grep -v '^pipelines/' | grep -v '^scripts/' || true)
+
+if [ -z "$STAGED_PY_FILES" ]; then
+    exit 0
+fi
+
+echo "Running pre-commit checks on staged Python files..."
+
+# Detect ruff command
+RUFF_CMD=""
+if command -v uv &>/dev/null && uv run ruff --version &>/dev/null 2>&1; then
+    RUFF_CMD="uv run ruff"
+elif command -v ruff &>/dev/null; then
+    RUFF_CMD="ruff"
+elif python -m ruff --version &>/dev/null 2>&1; then
+    RUFF_CMD="python -m ruff"
+else
+    echo "ERROR: ruff not found. Install it with:"
+    echo "  uv pip install -r requirements-dev.txt"
+    echo "  # or"
+    echo "  pip install ruff"
+    exit 1
+fi
+
+FAILED=0
+
+# Check formatting
+echo "Checking formatting..."
+if ! $RUFF_CMD format --check $STAGED_PY_FILES; then
+    echo ""
+    echo "Formatting issues found. Fix with:"
+    echo "  $RUFF_CMD format $STAGED_PY_FILES"
+    FAILED=1
+fi
+
+# Check linting
+echo "Checking linting..."
+if ! $RUFF_CMD check $STAGED_PY_FILES; then
+    echo ""
+    echo "Linting issues found. Fix with:"
+    echo "  $RUFF_CMD check --fix $STAGED_PY_FILES"
+    FAILED=1
+fi
+
+if [ $FAILED -ne 0 ]; then
+    echo ""
+    echo "Pre-commit checks failed. Fix the issues above and try again."
+    exit 1
+fi
+
+echo "All checks passed!"
