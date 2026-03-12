@@ -1,4 +1,7 @@
+.DS_Store
 .env
+.cursor
+/data
 venv/
 __pycache__/
 *.pyc
