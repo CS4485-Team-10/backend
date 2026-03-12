@@ -1,7 +1,5 @@
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlmodel import Session, select, func
+from sqlmodel import Session, func, select
 
 from app.core.database import get_session
 from app.models.channel import Channel
@@ -13,7 +11,7 @@ router = APIRouter()
 
 @router.get("/videos")
 def list_videos(
-    channel_id: Optional[str] = Query(None),
+    channel_id: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     session: Session = Depends(get_session),
