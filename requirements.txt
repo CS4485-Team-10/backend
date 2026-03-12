@@ -13,4 +13,4 @@ typing_extensions==4.15.0
 youtube-transcript-api==1.2.4
 fastapi==0.135.1
 uvicorn==0.41.0
-
+pydantic-settings==2.13.1
