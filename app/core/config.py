@@ -12,6 +12,13 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = ""
 
+    YOUTUBE_DATA_API_KEY: str = ""
+    YOUTUBE_SEARCH_QUERY: str = ""
+
+    # LLM-API Provisioning
+    LLM_PROVIDER: str = ""
+    LLM_MODEL: str = ""
+
     class Config:
         env_file = ".env"
 
