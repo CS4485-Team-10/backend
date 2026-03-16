@@ -8,6 +8,26 @@ uv pip install -r requirements.txt
 cp .env.example .env  # fill in your Supabase credentials
 ```
 
+## Development Setup
+
+```bash
+# Install dev dependencies and configure git hooks
+bash scripts/setup-hooks.sh
+```
+
+Or manually:
+
+```bash
+# Install dev dependencies
+uv pip install -r requirements-dev.txt  # or: pip install -r requirements-dev.txt
+
+# Configure git hooks
+git config core.hooksPath .githooks
+chmod +x .githooks/pre-commit
+```
+
+The pre-commit hook runs **ruff format** (formatting) and **ruff check** (linting) on staged Python files.
+
 ## Database Migrations (Alembic)
 
 Migrations live in `alembic/versions/`. The database URL is read from `DATABASE_URL` in `.env`.
