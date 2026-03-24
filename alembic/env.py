@@ -13,7 +13,45 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# region agent log
+def _agent_log_alembic_env(hypothesis_id: str, message: str, data: dict) -> None:
+    import json
+    import time
+    from pathlib import Path
+
+    try:
+        log_path = Path(__file__).resolve().parent.parent / ".cursor" / "debug-5c359c.log"
+        entry = {
+            "sessionId": "5c359c",
+            "runId": "initial",
+            "hypothesisId": hypothesis_id,
+            "location": "alembic/env.py:16",
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        # Logging must never break migrations
+        pass
+
+
+_agent_log_alembic_env(
+    hypothesis_id="H1",
+    message="DATABASE_URL characteristics before set_main_option",
+    data={
+        "is_set": bool(settings.DATABASE_URL),
+        "length": len(settings.DATABASE_URL or ""),
+        "contains_percent": "%" in (settings.DATABASE_URL or ""),
+    },
+)
+# endregion agent log
+
+config.set_main_option(
+    "sqlalchemy.url",
+    settings.DATABASE_URL.replace("%", "%%") if settings.DATABASE_URL else "",
+)
 
 target_metadata = SQLModel.metadata
 

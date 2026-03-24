@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
-from sqlmodel import Column, Field, JSON, SQLModel
+from sqlalchemy import BigInteger
+from sqlmodel import Column, Field, SQLModel
 
 
 class Video(SQLModel, table=True):
@@ -9,10 +10,12 @@ class Video(SQLModel, table=True):
 
     video_id: str = Field(primary_key=True)
     channel_id: str = Field(foreign_key="channels.channel_id")
+    channel_title: Optional[str] = None
     title: str
-    description: Optional[str] = None
-    view_count: int = 0
+    category_id: Optional[str] = None
     published_at: datetime
-    thumbnail_url: str
-    stats: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    view_count: Optional[int] = Field(default=None, sa_column=Column(BigInteger))
+    like_count: Optional[int] = Field(default=None, sa_column=Column(BigInteger))
+    comment_count: Optional[int] = Field(default=None, sa_column=Column(BigInteger))
+    duration_seconds: Optional[int] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
