@@ -288,6 +288,7 @@ def _fetch_candidate_video_ids(
                 maxResults=50,
                 publishedAfter=six_months_ago,
                 order="viewCount",
+                relevanceLanguage="en",
                 pageToken=page_token,
             )
             .execute()
@@ -307,10 +308,10 @@ def _fetch_candidate_video_ids(
 def _filter_by_impact(
     video_metadata: List[dict],
     *,
-    min_comments_per_1k: float = 2.5,
-    min_likes_per_1k: float = 25,
-    min_views: int = 1000,
-    percentile: float = 0.9,
+    min_comments_per_1k: float = 1.0,
+    min_likes_per_1k: float = 10,
+    min_views: int = 500,
+    percentile: float = 0.75,
 ) -> List[str]:
     """Compute impact features, filter by engagement thresholds, return top percentile video IDs."""
     impact_metrics = [_compute_impact_features(v) for v in video_metadata]
@@ -386,9 +387,25 @@ _ytt_api = YouTubeTranscriptApi()
 def _save_transcripts(
     sb, video_ids: List[str], *, verbose: bool = True
 ) -> int:
-    """Fetch transcripts, clean, and persist to Supabase. Returns count saved."""
+    """Fetch transcripts, clean, and persist to Supabase. Returns count saved.
+
+    Skips videos that already have a transcript row (avoids FK conflicts
+    when claims reference the existing transcript_id).
+    """
+    existing = (
+        sb.table("transcripts")
+        .select("video_id")
+        .in_("video_id", video_ids)
+        .execute()
+    )
+    already_have = {r["video_id"] for r in existing.data}
+
     saved = 0
     for video_id in video_ids:
+        if video_id in already_have:
+            if verbose:
+                print(f"Transcript already exists for {video_id}, skipping")
+            continue
         try:
             transcript = _ytt_api.fetch(video_id)
             segments = [
@@ -396,12 +413,17 @@ def _save_transcripts(
                 for s in transcript.snippets
             ]
             cleaned = _clean_transcript(segments)
-            sb.table("transcripts").delete().eq("video_id", video_id).execute()
+
+            if not cleaned and not segments:
+                if verbose:
+                    print(f"Empty transcript for {video_id}, skipping")
+                continue
+
             sb.table("transcripts").insert({
                 "transcript_id": str(uuid.uuid4()),
                 "video_id": video_id,
-                "cleaned_transcript_txt": cleaned,
-                "raw_transcript_json": {"segments": segments},
+                "cleaned_transcript_txt": cleaned or "",
+                "raw_transcript_json": {"segments": segments} if segments else {"segments": []},
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }).execute()
             saved += 1
@@ -455,10 +477,10 @@ def run_youtube_data_ingestion_pipeline(
     *,
     search_query: str = "personal health",
     max_search_pages: int = 10,
-    min_comments_per_1k: float = 2.5,
-    min_likes_per_1k: float = 25,
-    min_views: int = 1000,
-    percentile: float = 0.9,
+    min_comments_per_1k: float = 1.0,
+    min_likes_per_1k: float = 10,
+    min_views: int = 500,
+    percentile: float = 0.75,
     verbose: bool = True,
 ) -> dict:
     """
