@@ -6,45 +6,24 @@ YouTube Data Ingestion Pipeline.
 3. Filter by metadata impact
 4. Pull transcripts via youtube-transcript-api
 5. Pull comments via YouTube Data API
+6. Persist to Supabase (videos, transcripts, comments)
 """
 
 import json
 import math
 import os
 import re
-import shutil
+import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
+from supabase import create_client
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.formatters import JSONFormatter
 
 from pipelines.llm_insight_generation import OllamaProvider
 from pipelines.shared import LLMProvider
-
-# Resolve to backend/data (works when run from backend/ or pipelines/)
-DATA_ROOT = (
-    Path.cwd().parent / "data"
-    if Path.cwd().name == "pipelines"
-    else Path.cwd() / "data"
-)
-
-
-def _clear_data_dirs() -> None:
-    """Clear subdirectories: metadata, transcripts/cleaned, transcripts/raw, comments."""
-    dirs = [
-        DATA_ROOT / "metadata",
-        DATA_ROOT / "transcripts" / "cleaned",
-        DATA_ROOT / "transcripts" / "raw",
-        DATA_ROOT / "comments",
-    ]
-    for d in dirs:
-        if d.exists():
-            shutil.rmtree(d)
-        d.mkdir(parents=True, exist_ok=True)
 
 
 def _chunk_video_ids(lst: List[str], n: int):
@@ -348,27 +327,83 @@ def _filter_by_impact(
     return [v["video_id"] for v in high_impact]
 
 
-def _save_transcripts(
-    video_ids: List[str],
-    formatter: JSONFormatter,
-    *,
-    verbose: bool = True,
+_ISO_DURATION_RE = re.compile(
+    r"P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?"
+)
+
+
+def _parse_iso8601_duration(raw: str) -> Optional[int]:
+    """Parse an ISO 8601 duration like PT1H2M10S into total seconds."""
+    m = _ISO_DURATION_RE.match(raw or "")
+    if not m:
+        return None
+    days, hours, minutes, seconds = (int(g) if g else 0 for g in m.groups())
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _build_video_row(item: dict) -> dict:
+    """Map a YouTube videos.list item to a dict matching the Video SQLModel."""
+    snippet = item.get("snippet", {})
+    stats = item.get("statistics", {})
+    content = item.get("contentDetails", {})
+
+    published_at = datetime.fromisoformat(
+        snippet["publishedAt"].replace("Z", "+00:00")
+    )
+
+    return {
+        "video_id": item["id"],
+        "channel_id": snippet.get("channelId", ""),
+        "channel_title": snippet.get("channelTitle"),
+        "title": snippet.get("title", ""),
+        "category_id": snippet.get("categoryId"),
+        "published_at": published_at.isoformat(),
+        "view_count": int(stats.get("viewCount", 0) or 0),
+        "like_count": int(stats.get("likeCount", 0) or 0),
+        "comment_count": int(stats.get("commentCount", 0) or 0),
+        "duration_seconds": _parse_iso8601_duration(content.get("duration")),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _upsert_videos(
+    sb, video_metadata: List[dict], filtered_ids: List[str], *, verbose: bool = True
 ) -> int:
-    """Fetch raw transcripts, clean, and save to raw/ and cleaned/ directories. Returns count saved."""
-    (DATA_ROOT / "transcripts" / "raw").mkdir(parents=True, exist_ok=True)
-    (DATA_ROOT / "transcripts" / "cleaned").mkdir(parents=True, exist_ok=True)
+    """Build Video rows for filtered IDs and upsert into Supabase."""
+    by_id = {v["id"]: v for v in video_metadata}
+    rows = [_build_video_row(by_id[vid]) for vid in filtered_ids if vid in by_id]
+    if not rows:
+        return 0
+    sb.table("videos").upsert(rows, on_conflict="video_id").execute()
+    if verbose:
+        print(f"Upserted {len(rows)} video(s) to Supabase")
+    return len(rows)
+
+
+_ytt_api = YouTubeTranscriptApi()
+
+
+def _save_transcripts(
+    sb, video_ids: List[str], *, verbose: bool = True
+) -> int:
+    """Fetch transcripts, clean, and persist to Supabase. Returns count saved."""
     saved = 0
     for video_id in video_ids:
         try:
-            raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
-            json_formatted = formatter.format_transcript(raw_transcript, indent=2)
-            (DATA_ROOT / "transcripts" / "raw" / f"{video_id}.json").write_text(
-                json_formatted, encoding="utf-8"
-            )
-            cleaned = _clean_transcript(raw_transcript)
-            (DATA_ROOT / "transcripts" / "cleaned" / f"{video_id}.txt").write_text(
-                cleaned, encoding="utf-8"
-            )
+            transcript = _ytt_api.fetch(video_id)
+            segments = [
+                {"text": s.text, "start": s.start, "duration": s.duration}
+                for s in transcript.snippets
+            ]
+            cleaned = _clean_transcript(segments)
+            sb.table("transcripts").delete().eq("video_id", video_id).execute()
+            sb.table("transcripts").insert({
+                "transcript_id": str(uuid.uuid4()),
+                "video_id": video_id,
+                "cleaned_transcript_txt": cleaned,
+                "raw_transcript_json": {"segments": segments},
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
             saved += 1
         except Exception as e:
             if verbose:
@@ -376,9 +411,10 @@ def _save_transcripts(
     return saved
 
 
-def _save_comments(youtube, video_ids: List[str]) -> int:
-    """Fetch comments and save to comments/ directory. Returns count saved."""
-    (DATA_ROOT / "comments").mkdir(parents=True, exist_ok=True)
+def _save_comments(
+    sb, youtube, video_ids: List[str], *, verbose: bool = True
+) -> int:
+    """Fetch comments and persist to Supabase. Returns count saved."""
     saved = 0
     for video_id in video_ids:
         try:
@@ -400,13 +436,18 @@ def _save_comments(youtube, video_ids: List[str]) -> int:
                 page_token = resp.get("nextPageToken")
                 if not page_token:
                     break
-            (DATA_ROOT / "comments" / f"{video_id}.json").write_text(
-                json.dumps({"items": comment_items}, indent=2),
-                encoding="utf-8",
-            )
+            sb.table("comments").upsert(
+                {
+                    "video_id": video_id,
+                    "comment_threads_json": {"items": comment_items},
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+                on_conflict="video_id",
+            ).execute()
             saved += 1
-        except Exception:
-            pass
+        except Exception as e:
+            if verbose:
+                print(f"No comments for {video_id}: {e}")
     return saved
 
 
@@ -424,18 +465,23 @@ def run_youtube_data_ingestion_pipeline(
     Main entrypoint for the YouTube data ingestion pipeline.
 
     Coordinates the full workflow: search for videos, fetch metadata,
-    filter by impact, save transcripts and comments. Call this from a backend
-    route or run locally via `python -m pipelines.yt_data_ingestion`.
+    filter by semantic relevance and impact, then persist videos,
+    transcripts, and comments to Supabase.
 
     Returns:
-        dict with keys: video_ids, transcripts_saved, comments_saved
+        dict with keys: video_ids, videos_upserted, transcripts_saved, comments_saved
     """
     load_dotenv()
     api_key = os.getenv("YOUTUBE_DATA_API_KEY")
     if not api_key:
         raise ValueError("YOUTUBE_DATA_API_KEY not set in environment")
 
-    _clear_data_dirs()
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not supabase_key:
+        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
+
+    sb = create_client(supabase_url, supabase_key)
     youtube = build(serviceName="youtube", version="v3", developerKey=api_key)
 
     video_ids = _fetch_candidate_video_ids(
@@ -461,30 +507,19 @@ def run_youtube_data_ingestion_pipeline(
     if verbose:
         print(f"After impact filter: {len(filtered_ids)} high-impact")
 
-    formatter = JSONFormatter()
-    transcripts_saved = _save_transcripts(
-        filtered_ids, formatter, verbose=verbose
-    )
-    comments_saved = _save_comments(youtube, filtered_ids)
+    videos_upserted = _upsert_videos(sb, video_metadata, filtered_ids, verbose=verbose)
+    transcripts_saved = _save_transcripts(sb, filtered_ids, verbose=verbose)
+    comments_saved = _save_comments(sb, youtube, filtered_ids, verbose=verbose)
 
     if verbose:
-        raw_count = sum(
-            1
-            for p in (DATA_ROOT / "transcripts" / "raw").iterdir()
-            if p.is_file()
+        print(
+            f"Pipeline complete: {videos_upserted} videos, "
+            f"{transcripts_saved} transcripts, {comments_saved} comments"
         )
-        cleaned_count = sum(
-            1
-            for p in (DATA_ROOT / "transcripts" / "cleaned").iterdir()
-            if p.is_file()
-        )
-        if raw_count == cleaned_count:
-            print(f"Verification: {raw_count} files in both directories.")
-        else:
-            print(f"Mismatch: {raw_count} raw, {cleaned_count} cleaned")
 
     return {
         "video_ids": filtered_ids,
+        "videos_upserted": videos_upserted,
         "transcripts_saved": transcripts_saved,
         "comments_saved": comments_saved,
     }
