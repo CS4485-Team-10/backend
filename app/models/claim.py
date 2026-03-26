@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import Numeric
 from sqlmodel import Column, Field, SQLModel, Text
 
 
@@ -14,5 +15,20 @@ class Claim(SQLModel, table=True):
     claim_text: str = Field(sa_column=Column(Text, nullable=False))
     supporting_excerpt: Optional[str] = Field(default=None, sa_column=Column(Text))
     start_time_seconds: Optional[int] = None
+    
     end_time_seconds: Optional[int] = None
+    sentiment_label: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    sentiment_score: Optional[float] = Field(
+        default=None,
+        sa_column=Column(Numeric(4, 3), nullable=True),
+    )
+    fact_check_status: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    llm_confidence: Optional[float] = Field(
+        default=None,
+        sa_column=Column(Numeric(5, 4), nullable=True),
+    )
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

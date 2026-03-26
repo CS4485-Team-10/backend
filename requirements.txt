@@ -21,3 +21,5 @@ google-api-python-client
 python-dotenv
 
 youtube-transcript-api
+sentence-transformers
+numpy
