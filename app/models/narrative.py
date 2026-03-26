@@ -10,5 +10,6 @@ class Narrative(SQLModel, table=True):
 
     narrative_id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     narrative_label: str
+    narrative_risk: str
     narrative_description: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

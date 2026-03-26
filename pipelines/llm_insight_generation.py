@@ -1,70 +1,148 @@
 """
 LLM Insight Generation Pipeline.
 
-Takes transcripts from the ingestion pipeline and passes them into an LLM
-to extract claims, narratives, and trends.
+Reads transcripts from Supabase (only those without existing claims),
+extracts claims via an LLM, semantically matches or creates narratives,
+and persists claims, narratives, and claim_narratives back to Supabase.
+
+Re-runs are safe: prior claims and bridge rows for a transcript are
+deleted before new ones are inserted (replace semantics for CRON jobs).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional
 
 import requests
+from dotenv import load_dotenv
+from supabase import create_client
 
-from pipelines.shared import GeneratedInsights, LLMProvider, TranscriptRecord
-
-# ---------------------------------------------------------------------------
-# Path resolution
-# ---------------------------------------------------------------------------
-
-DATA_ROOT = (
-    Path.cwd().parent / "data"
-    if Path.cwd().name == "pipelines"
-    else Path.cwd() / "data"
+from pipelines.narrative_matching import (
+    MatchDecision,
+    NarrativeCandidate,
+    build_candidate_pool,
+    match_claim_to_narratives,
+    refresh_pool_with_new,
 )
+from pipelines.shared import LLMProvider
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Environment bootstrap
+# ---------------------------------------------------------------------------
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+
+_PAGE_SIZE = 1000
 
 
-def _resolve_cleaned_dir() -> Path:
-    """Resolve path to data/transcripts/cleaned relative to backend root."""
-    return DATA_ROOT / "transcripts" / "cleaned"
-
-
-def _resolve_raw_json_dir() -> Path:
-    """Resolve path to data/transcripts/raw relative to backend root."""
-    return DATA_ROOT / "transcripts" / "raw"
+def _get_supabase():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ---------------------------------------------------------------------------
-# 1. Load & Build Transcripts (private helpers)
+# 1. Supabase reads
 # ---------------------------------------------------------------------------
 
 
-def _load_cleaned_transcript(fp: Union[str, Path]) -> str:
-    """Load a single cleaned transcript file and return its text content."""
-    file_path = Path(fp)
-    if not file_path.exists():
-        raise FileNotFoundError(f"Transcript file not found: {file_path}")
-    if file_path.suffix != ".txt":
-        raise ValueError(f"File is not formatted as a .txt file: {file_path}")
-    return file_path.read_text(encoding="utf-8")
+def _fetch_transcripts_without_claims(sb) -> List[Dict[str, Any]]:
+    """Return transcripts rows that have no corresponding claims yet.
+
+    Uses Supabase PostgREST: fetch all transcripts, then subtract those
+    whose transcript_id already appears in claims (set difference in Python
+    since PostgREST has limited subquery support).
+    """
+    all_transcripts: List[Dict[str, Any]] = []
+    offset = 0
+    while True:
+        page = (
+            sb.table("transcripts")
+            .select("video_id, transcript_id, cleaned_transcript_txt")
+            .range(offset, offset + _PAGE_SIZE - 1)
+            .execute()
+        )
+        all_transcripts.extend(page.data)
+        if len(page.data) < _PAGE_SIZE:
+            break
+        offset += _PAGE_SIZE
+
+    if not all_transcripts:
+        return []
+
+    claimed_ids: set[str] = set()
+    offset = 0
+    while True:
+        page = (
+            sb.table("claims")
+            .select("transcript_id")
+            .range(offset, offset + _PAGE_SIZE - 1)
+            .execute()
+        )
+        for row in page.data:
+            claimed_ids.add(str(row["transcript_id"]))
+        if len(page.data) < _PAGE_SIZE:
+            break
+        offset += _PAGE_SIZE
+
+    return [
+        t for t in all_transcripts if str(t["transcript_id"]) not in claimed_ids
+    ]
 
 
-def _transcript_record_from_path(fp: Union[str, Path]) -> TranscriptRecord:
-    """Build a TranscriptRecord from a single cleaned transcript file path."""
-    path = Path(fp).resolve()
-    video_id = path.stem
-    return TranscriptRecord(
-        video_id=video_id,
-        cleaned_txt_path=path,
-        raw_json_path=None,
+def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
+    """Paginated fetch of all rows from the narratives table."""
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+    while True:
+        page = (
+            sb.table("narratives")
+            .select("narrative_id, narrative_label, narrative_risk, narrative_description")
+            .range(offset, offset + _PAGE_SIZE - 1)
+            .execute()
+        )
+        rows.extend(page.data)
+        if len(page.data) < _PAGE_SIZE:
+            break
+        offset += _PAGE_SIZE
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# 2. Replace-semantics: delete old insights for a transcript
+# ---------------------------------------------------------------------------
+
+
+def _delete_existing_insights(sb, transcript_id: str) -> None:
+    """Remove claim_narratives and claims for *transcript_id* (FK-safe order)."""
+    existing_claims = (
+        sb.table("claims")
+        .select("claim_id")
+        .eq("transcript_id", transcript_id)
+        .execute()
     )
+    claim_ids = [r["claim_id"] for r in existing_claims.data]
+    if not claim_ids:
+        return
+
+    for cid in claim_ids:
+        sb.table("claim_narratives").delete().eq("claim_id", cid).execute()
+    sb.table("claims").delete().eq("transcript_id", transcript_id).execute()
 
 
 # ---------------------------------------------------------------------------
-# 2. Prepare for Analysis (private helpers)
+# 3. Chunking & LLM extraction
 # ---------------------------------------------------------------------------
 
 
@@ -90,39 +168,21 @@ def _chunk_text(text: str, max_chars: int = 12000) -> List[str]:
     return chunks if chunks else [text]
 
 
-def _validate_json_output(text: str) -> Dict[str, Any]:
-    """Parse and sanity-check the model output as JSON. Requires 'claims' key."""
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON: {e}") from e
-
-    if not isinstance(parsed, dict):
-        raise ValueError("Model output must be a JSON object (dict)")
-
-    if "claims" not in parsed:
-        raise ValueError("Model output must contain a 'claims' key")
-
-    if not isinstance(parsed["claims"], list):
-        raise ValueError("'claims' must be a list")
-
-    return parsed
-
-
-# ---------------------------------------------------------------------------
-# 3. Output structure
-# ---------------------------------------------------------------------------
-
 _SYSTEM = "You extract factual claims from the transcript. Return ONLY valid JSON."
 _SCHEMA_HINT = """
 {
-  "claims": [{"text": "string", "confidence": 0.0}]
+  "claims": [
+    {
+      "text": "string",
+      "confidence": 0.0,
+      "narrative_theme": "optional short theme"
+    }
+  ]
 }
 """.strip()
 
 
 def _build_user_prompt(transcript_chunk: str) -> str:
-    """Build the user prompt for the LLM, including the expected JSON shape."""
     return f"""Extract the main factual claims from the following transcript.
 
 Expected JSON output format (return ONLY valid JSON, no other text):
@@ -133,24 +193,42 @@ Transcript:
 {transcript_chunk}
 ---
 
-Return your response as a single JSON object with a "claims" array. Each claim should have "text" (the claim) and "confidence" (0.0 to 1.0)."""
+Return a single JSON object with a "claims" array. Each claim must have:
+- "text": the factual claim (string)
+- "confidence": how confident you are in this claim (0.0 to 1.0)
+- "narrative_theme": a short phrase describing the overarching narrative this claim belongs to (optional but preferred)"""
 
 
-def _extract_insights_for_record(
-    record: TranscriptRecord,
+def _validate_json_output(text: str) -> Dict[str, Any]:
+    """Parse and validate the LLM JSON output."""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e}") from e
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Model output must be a JSON object (dict)")
+    if "claims" not in parsed:
+        raise ValueError("Model output must contain a 'claims' key")
+    if not isinstance(parsed["claims"], list):
+        raise ValueError("'claims' must be a list")
+    return parsed
+
+
+def _extract_claims(
+    transcript_text: str,
     provider: LLMProvider,
     *,
     max_chars: int = 12000,
     retries: int = 2,
-) -> GeneratedInsights:
-    """Load transcript, chunk it, run provider on each chunk, merge and return GeneratedInsights."""
-    text = _load_cleaned_transcript(record.cleaned_txt_path)
-    chunks = _chunk_text(text, max_chars=max_chars)
+) -> List[Dict[str, Any]]:
+    """Chunk transcript, call LLM per chunk, dedupe and return claims."""
+    chunks = _chunk_text(transcript_text, max_chars=max_chars)
     all_claims: List[Dict[str, Any]] = []
 
     for chunk in chunks:
         user_prompt = _build_user_prompt(chunk)
-        last_error = None
+        last_error: Optional[Exception] = None
         for attempt in range(retries + 1):
             try:
                 raw = provider.generate_response(
@@ -165,27 +243,17 @@ def _extract_insights_for_record(
                     raise last_error from last_error
 
     seen: set[str] = set()
-    unique_claims: List[Dict[str, Any]] = []
+    unique: List[Dict[str, Any]] = []
     for c in all_claims:
         t = c.get("text", "")
         if t and t not in seen:
             seen.add(t)
-            unique_claims.append(c)
-
-    return GeneratedInsights(
-        video_id=record.video_id,
-        claims=unique_claims,
-        narratives=[],
-        model=provider.model,
-        provider=provider.provider,
-        source_cleaned_txt=str(record.cleaned_txt_path),
-        source_raw_json=str(record.raw_json_path) if record.raw_json_path else None,
-        chunk_count=len(chunks),
-    )
+            unique.append(c)
+    return unique
 
 
 # ---------------------------------------------------------------------------
-# 4. LLM Providers (public - used for provider selection)
+# 4. LLM Providers
 # ---------------------------------------------------------------------------
 
 
@@ -247,50 +315,88 @@ class BedrockProvider(LLMProvider):
         raise NotImplementedError("BedrockProvider not yet implemented")
 
 
-# ---------------------------------------------------------------------------
-# 5. Private batch helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_transcript_records(
-    cleaned_dir: Union[str, Path],
-    raw_json_dir: Union[str, Path, None] = None,
-) -> List[TranscriptRecord]:
-    """Scan cleaned_dir (and optionally raw_json_dir) and build TranscriptRecord for each transcript."""
-    cleaned_path = Path(cleaned_dir)
-    raw_path = Path(raw_json_dir) if raw_json_dir else None
-    records: List[TranscriptRecord] = []
-    for fp in sorted(cleaned_path.glob("*.txt")):
-        video_id = fp.stem
-        raw_json = (
-            (raw_path / f"{video_id}.json")
-            if raw_path and raw_path.exists()
-            else None
-        )
-        records.append(
-            TranscriptRecord(
-                video_id=video_id,
-                cleaned_txt_path=fp.resolve(),
-                raw_json_path=(
-                    raw_json.resolve() if raw_json and raw_json.exists() else None
-                ),
-            )
-        )
-    return records
-
-
 def _get_provider_from_env() -> LLMProvider:
     """Create LLM provider from LLM_PROVIDER and LLM_MODEL env vars."""
-    provider_name = os.environ.get("LLM_PROVIDER", "ollama").lower()
-    model = os.environ.get("LLM_MODEL", "llama3")
+    provider_name = (os.environ.get("LLM_PROVIDER") or "ollama").lower()
+    model = os.environ.get("LLM_MODEL") or "llama3"
+    base_url = os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
 
     if provider_name == "ollama":
-        return OllamaProvider(model=model)
+        return OllamaProvider(model=model, base_url=base_url)
     if provider_name == "bedrock":
         return BedrockProvider(model=model)
     raise ValueError(
         f"Unknown LLM_PROVIDER: {provider_name}. Use 'ollama' or 'bedrock'."
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. Supabase writes
+# ---------------------------------------------------------------------------
+
+
+def _persist_insights(
+    sb,
+    video_id: str,
+    transcript_id: str,
+    claims: List[Dict[str, Any]],
+    narrative_assignments: List[MatchDecision],
+    new_narratives: List[NarrativeCandidate],
+) -> int:
+    """Insert narratives, claims, and claim_narratives to Supabase.
+
+    Returns the number of claims inserted.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    # 1. Insert new narratives
+    if new_narratives:
+        narr_rows = [
+            {
+                "narrative_id": str(n.narrative_id),
+                "narrative_label": n.narrative_label,
+                "narrative_risk": n.narrative_risk,
+                "narrative_description": n.narrative_description,
+                "created_at": now,
+            }
+            for n in new_narratives
+        ]
+        sb.table("narratives").insert(narr_rows).execute()
+
+    # 2. Insert claims
+    claim_rows = []
+    claim_ids: List[str] = []
+    for c in claims:
+        cid = str(uuid.uuid4())
+        claim_ids.append(cid)
+        claim_rows.append(
+            {
+                "claim_id": cid,
+                "video_id": video_id,
+                "transcript_id": transcript_id,
+                "claim_text": c["text"],
+                "llm_confidence": c.get("confidence"),
+                "created_at": now,
+            }
+        )
+    if claim_rows:
+        sb.table("claims").insert(claim_rows).execute()
+
+    # 3. Insert claim_narratives bridge rows
+    bridge_rows = []
+    for cid, decision in zip(claim_ids, narrative_assignments):
+        for nid in decision.linked_narrative_ids:
+            bridge_rows.append(
+                {
+                    "claim_id": cid,
+                    "narrative_id": str(nid),
+                    "created_at": now,
+                }
+            )
+    if bridge_rows:
+        sb.table("claim_narratives").insert(bridge_rows).execute()
+
+    return len(claim_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -300,62 +406,96 @@ def _get_provider_from_env() -> LLMProvider:
 
 def run_llm_insight_generation_pipeline(
     *,
-    cleaned_dir: Union[str, Path, None] = None,
-    raw_json_dir: Union[str, Path, None] = None,
     provider: LLMProvider | None = None,
-    verbose: bool = True,
 ) -> dict:
+    """Main entrypoint for the LLM insight generation pipeline.
+
+    Reads transcripts from Supabase that have no claims yet, runs LLM
+    extraction, matches/creates narratives, and persists all rows.
+    Safe for repeated / CRON invocations: existing claims for a
+    transcript are deleted before re-inserting (replace semantics).
+
+    Run locally:
+        conda activate yt-intel-project
+        python -m pipelines.llm_insight_generation
+
+    Returns
+    -------
+    dict with keys: video_ids, total_claims, total_new_narratives
     """
-    Main entrypoint for the LLM insight generation pipeline.
-
-    Loads transcripts from storage, runs extraction per transcript via the
-    configured LLM provider, and returns a results summary. Call this from a
-    backend route or run locally via `python -m pipelines.llm_insight_generation`.
-
-    Uses LLM_PROVIDER (ollama|bedrock) and LLM_MODEL env vars when provider
-    is not passed.
-
-    Returns:
-        dict with keys: insights, video_ids, total_claims
-    """
-    cleaned = cleaned_dir or _resolve_cleaned_dir()
-    raw = raw_json_dir or _resolve_raw_json_dir()
-
-    if not Path(cleaned).exists():
-        raise FileNotFoundError(
-            f"Cleaned transcripts directory not found: {cleaned} "
-            "(run ingestion pipeline first)"
-        )
-
-    records = _build_transcript_records(
-        cleaned, raw if Path(raw).exists() else None
-    )
-    if not records:
-        return {"insights": [], "video_ids": [], "total_claims": 0}
-
+    sb = _get_supabase()
     prov = provider or _get_provider_from_env()
-    insights: List[GeneratedInsights] = []
 
-    for record in records:
+    transcripts = _fetch_transcripts_without_claims(sb)
+    if not transcripts:
+        log.info("No unprocessed transcripts found.")
+        return {"video_ids": [], "total_claims": 0, "total_new_narratives": 0}
+
+    log.info("Processing %d transcript(s)", len(transcripts))
+
+    existing_narr_rows = _fetch_all_narratives(sb)
+    candidates, candidate_embeddings = build_candidate_pool(existing_narr_rows)
+
+    total_claims = 0
+    total_new_narratives = 0
+    processed_video_ids: List[str] = []
+
+    for t in transcripts:
+        video_id = t["video_id"]
+        transcript_id = str(t["transcript_id"])
+        text = t["cleaned_transcript_txt"]
+
         try:
-            result = _extract_insights_for_record(record, prov)
-            insights.append(result)
-            if verbose:
-                print(
-                    f"  {record.video_id}: {len(result.claims)} claims, "
-                    f"{result.chunk_count} chunks"
-                )
-        except Exception as e:
-            if verbose:
-                print(f"  {record.video_id}: ERROR - {e}")
+            _delete_existing_insights(sb, transcript_id)
 
-    total_claims = sum(len(i.claims) for i in insights)
+            claims = _extract_claims(text, prov)
+            if not claims:
+                log.info("%s: 0 claims extracted, skipping.", video_id)
+                continue
+
+            decisions: List[MatchDecision] = []
+            run_new_narratives: List[NarrativeCandidate] = []
+
+            for c in claims:
+                decision = match_claim_to_narratives(
+                    claim_text=c["text"],
+                    narrative_theme=c.get("narrative_theme"),
+                    candidates=candidates,
+                    candidate_embeddings=candidate_embeddings,
+                )
+                decisions.append(decision)
+                if decision.new_narrative:
+                    run_new_narratives.append(decision.new_narrative)
+                    candidate_embeddings = refresh_pool_with_new(
+                        candidates, candidate_embeddings, decision.new_narrative
+                    )
+
+            inserted = _persist_insights(
+                sb, video_id, transcript_id, claims, decisions, run_new_narratives
+            )
+            total_claims += inserted
+            total_new_narratives += len(run_new_narratives)
+            processed_video_ids.append(video_id)
+            log.info(
+                "%s: %d claims, %d new narratives",
+                video_id,
+                inserted,
+                len(run_new_narratives),
+            )
+        except Exception:
+            log.exception("Failed to process %s", video_id)
+
     return {
-        "insights": insights,
-        "video_ids": [i.video_id for i in insights],
+        "video_ids": processed_video_ids,
         "total_claims": total_claims,
+        "total_new_narratives": total_new_narratives,
     }
 
 
 if __name__ == "__main__":
-    run_llm_insight_generation_pipeline()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    )
+    result = run_llm_insight_generation_pipeline()
+    log.info("Pipeline complete: %s", result)

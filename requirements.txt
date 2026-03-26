@@ -19,3 +19,5 @@ google-api-python-client
 python-dotenv
 youtube-transcript-api
 uvicorn[standard]==0.34.3
+sentence-transformers
+numpy
