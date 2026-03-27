@@ -25,6 +25,64 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from pipelines.llm_insight_generation import OllamaProvider
 from pipelines.shared import LLMProvider
 
+# YouTube Data API v3 quota unit costs per request.
+# Source: https://developers.google.com/youtube/v3/determine_quota_cost
+_QUOTA_COST_SEARCH_LIST = 100
+_QUOTA_COST_VIDEOS_LIST = 1
+_QUOTA_COST_COMMENT_THREADS_LIST = 1
+
+_DEFAULT_QUOTA_BUDGET = 9000  # keep a 1000-unit buffer under the 10,000/day default
+_DEFAULT_COMMENTS_MAX_PAGES = 20  # cap per-video comment pagination
+
+# Tuned for ~300+ deduplicated candidate IDs with 6-month window and default pagination.
+_DEFAULT_SEARCH_QUERIES = [
+    "personal mental health",
+    "personal fitness health journey",
+    "personal nutrition diet health",
+    "sleep health tips",
+    "chronic illness management",
+    "pregnancy health personal",
+    "preventive health wellness",
+]
+
+
+class QuotaBudget:
+    """Tracks YouTube Data API quota unit consumption against a budget.
+
+    Call ``try_consume`` before every API request.  When the budget is
+    exhausted the method returns ``False`` and records the breach context
+    so callers can stop gracefully.
+    """
+
+    def __init__(self, budget: int = _DEFAULT_QUOTA_BUDGET):
+        self.budget = budget
+        self.used = 0
+        self.breached = False
+        self.breach_stage: Optional[str] = None
+        self.breach_detail: Optional[str] = None
+
+    @property
+    def remaining(self) -> int:
+        return max(self.budget - self.used, 0)
+
+    def try_consume(self, cost: int, *, stage: str = "", detail: str = "") -> bool:
+        """Attempt to consume *cost* units.  Returns True on success."""
+        if self.used + cost > self.budget:
+            if not self.breached:
+                self.breached = True
+                self.breach_stage = stage
+                self.breach_detail = detail
+            return False
+        self.used += cost
+        return True
+
+    def summary(self) -> str:
+        status = "QUOTA_BREACH" if self.breached else "OK"
+        msg = f"[quota] {status}: used={self.used}/{self.budget} units"
+        if self.breached:
+            msg += f"; breach_stage={self.breach_stage}; detail={self.breach_detail}"
+        return msg
+
 
 def _chunk_video_ids(lst: List[str], n: int):
     """Break video_ids into smaller chunks for API request limits."""
@@ -32,10 +90,18 @@ def _chunk_video_ids(lst: List[str], n: int):
         yield lst[i : i + n]
 
 
-def _fetch_video_metadata(youtube, video_ids: List[str]) -> List[dict]:
+def _fetch_video_metadata(
+    youtube, video_ids: List[str], budget: QuotaBudget
+) -> List[dict]:
     """Fetch hydrated video metrics (snippet, statistics, contentDetails) for given IDs."""
     all_items: List[dict] = []
     for job in _chunk_video_ids(video_ids, 50):
+        if not budget.try_consume(
+            _QUOTA_COST_VIDEOS_LIST,
+            stage="videos.list",
+            detail=f"chunk starting {job[0]}",
+        ):
+            break
         resp = (
             youtube.videos()
             .list(
@@ -267,42 +333,64 @@ def filter_videos_by_public_health_relevance(
 
 def _fetch_candidate_video_ids(
     youtube,
+    budget: QuotaBudget,
     *,
-    search_query: str = "personal health",
+    search_queries: List[str] = _DEFAULT_SEARCH_QUERIES,
     max_search_pages: int = 10,
+    verbose: bool = True,
 ) -> List[str]:
-    """Fetch candidate video IDs from YouTube search API (paginated)."""
+    """Fetch candidate video IDs by fanning out across multiple search queries.
+
+    Each query is independently paginated.  Results are deduplicated so
+    overlapping queries don't inflate the candidate set.
+    """
     six_months_ago = (
         datetime.now(timezone.utc) - timedelta(days=180)
     ).strftime("%Y-%m-%dT00:00:00Z")
 
-    all_items: List[dict] = []
-    page_token = None
-    for _ in range(max_search_pages):
-        resp = (
-            youtube.search()
-            .list(
-                q=search_query,
-                part="snippet",
-                type="video",
-                maxResults=50,
-                publishedAfter=six_months_ago,
-                order="viewCount",
-                relevanceLanguage="en",
-                pageToken=page_token,
-            )
-            .execute()
-        )
-        all_items.extend(resp.get("items", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
+    seen_ids: set[str] = set()
+
+    for query in search_queries:
+        if budget.breached:
             break
 
-    return [
-        item["id"]["videoId"]
-        for item in all_items
-        if item.get("id", {}).get("kind") == "youtube#video"
-    ]
+        query_count = 0
+        page_token = None
+        for page_num in range(max_search_pages):
+            if not budget.try_consume(
+                _QUOTA_COST_SEARCH_LIST,
+                stage="search.list",
+                detail=f"q={query!r} page {page_num + 1}/{max_search_pages}",
+            ):
+                break
+            resp = (
+                youtube.search()
+                .list(
+                    q=query,
+                    part="snippet",
+                    type="video",
+                    maxResults=50,
+                    publishedAfter=six_months_ago,
+                    order="viewCount",
+                    relevanceLanguage="en",
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            for item in resp.get("items", []):
+                vid = item.get("id", {}).get("videoId")
+                if vid and item.get("id", {}).get("kind") == "youtube#video":
+                    if vid not in seen_ids:
+                        seen_ids.add(vid)
+                        query_count += 1
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        if verbose:
+            print(f"  query {query!r}: {query_count} new IDs (total {len(seen_ids)})")
+
+    return list(seen_ids)
 
 
 def _filter_by_impact(
@@ -434,15 +522,38 @@ def _save_transcripts(
 
 
 def _save_comments(
-    sb, youtube, video_ids: List[str], *, verbose: bool = True
+    sb,
+    youtube,
+    video_ids: List[str],
+    budget: QuotaBudget,
+    *,
+    max_pages_per_video: int = _DEFAULT_COMMENTS_MAX_PAGES,
+    verbose: bool = True,
 ) -> int:
-    """Fetch comments and persist to Supabase. Returns count saved."""
+    """Fetch comments and persist to Supabase. Returns count saved.
+
+    Stops processing further videos when the quota budget is exhausted.
+    """
     saved = 0
-    for video_id in video_ids:
+    for idx, video_id in enumerate(video_ids):
+        if budget.breached:
+            if verbose:
+                print(
+                    f"  [quota] stopping comments — "
+                    f"processed {idx}/{len(video_ids)} videos"
+                )
+            break
         try:
             comment_items: List[dict] = []
             page_token = None
-            while True:
+            pages_fetched = 0
+            while pages_fetched < max_pages_per_video:
+                if not budget.try_consume(
+                    _QUOTA_COST_COMMENT_THREADS_LIST,
+                    stage="commentThreads.list",
+                    detail=f"video={video_id} page={pages_fetched + 1}",
+                ):
+                    break
                 resp = (
                     youtube.commentThreads()
                     .list(
@@ -455,18 +566,20 @@ def _save_comments(
                     .execute()
                 )
                 comment_items.extend(resp.get("items", []))
+                pages_fetched += 1
                 page_token = resp.get("nextPageToken")
                 if not page_token:
                     break
-            sb.table("comments").upsert(
-                {
-                    "video_id": video_id,
-                    "comment_threads_json": {"items": comment_items},
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                },
-                on_conflict="video_id",
-            ).execute()
-            saved += 1
+            if comment_items:
+                sb.table("comments").upsert(
+                    {
+                        "video_id": video_id,
+                        "comment_threads_json": {"items": comment_items},
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    on_conflict="video_id",
+                ).execute()
+                saved += 1
         except Exception as e:
             if verbose:
                 print(f"No comments for {video_id}: {e}")
@@ -475,12 +588,14 @@ def _save_comments(
 
 def run_youtube_data_ingestion_pipeline(
     *,
-    search_query: str = "personal health",
+    search_queries: Optional[List[str]] = None,
     max_search_pages: int = 10,
     min_comments_per_1k: float = 1.0,
     min_likes_per_1k: float = 10,
     min_views: int = 500,
     percentile: float = 0.75,
+    quota_budget: Optional[int] = None,
+    comments_max_pages: Optional[int] = None,
     verbose: bool = True,
 ) -> dict:
     """
@@ -490,8 +605,17 @@ def run_youtube_data_ingestion_pipeline(
     filter by semantic relevance and impact, then persist videos,
     transcripts, and comments to Supabase.
 
+    Args:
+        search_queries: List of search terms to fan out across.
+            Defaults to _DEFAULT_SEARCH_QUERIES (~10 public-health terms).
+        quota_budget: Max YouTube API quota units this run may consume.
+            Defaults to env var YT_QUOTA_DAILY_BUDGET_UNITS or 9000.
+        comments_max_pages: Max comment pages fetched per video.
+            Defaults to env var YT_COMMENTS_MAX_PAGES_PER_VIDEO or 20.
+
     Returns:
-        dict with keys: video_ids, videos_upserted, transcripts_saved, comments_saved
+        dict with keys: video_ids, videos_upserted, transcripts_saved,
+        comments_saved, quota_used, quota_budget, quota_breached
     """
     load_dotenv()
     api_key = os.getenv("YOUTUBE_DATA_API_KEY")
@@ -503,47 +627,82 @@ def run_youtube_data_ingestion_pipeline(
     if not supabase_url or not supabase_key:
         raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
 
+    budget_limit = quota_budget or int(
+        os.getenv("YT_QUOTA_DAILY_BUDGET_UNITS", str(_DEFAULT_QUOTA_BUDGET))
+    )
+    max_comment_pages = comments_max_pages or int(
+        os.getenv("YT_COMMENTS_MAX_PAGES_PER_VIDEO", str(_DEFAULT_COMMENTS_MAX_PAGES))
+    )
+    budget = QuotaBudget(budget=budget_limit)
+
     sb = create_client(supabase_url, supabase_key)
     youtube = build(serviceName="youtube", version="v3", developerKey=api_key)
 
+    queries = search_queries or _DEFAULT_SEARCH_QUERIES
     video_ids = _fetch_candidate_video_ids(
-        youtube, search_query=search_query, max_search_pages=max_search_pages
+        youtube,
+        budget,
+        search_queries=queries,
+        max_search_pages=max_search_pages,
+        verbose=verbose,
     )
     if verbose:
         print(f"Search results: {len(video_ids)} candidates")
 
-    video_metadata = _fetch_video_metadata(youtube, video_ids)
-    video_metadata = filter_videos_by_public_health_relevance(
-        video_metadata, verbose=verbose
-    )
-    if verbose:
-        print(f"After semantic filter: {len(video_metadata)} public-health-relevant")
+    video_metadata: List[dict] = []
+    filtered_ids: List[str] = []
+    videos_upserted = 0
+    transcripts_saved = 0
+    comments_saved = 0
 
-    filtered_ids = _filter_by_impact(
-        video_metadata,
-        min_comments_per_1k=min_comments_per_1k,
-        min_likes_per_1k=min_likes_per_1k,
-        min_views=min_views,
-        percentile=percentile,
-    )
-    if verbose:
-        print(f"After impact filter: {len(filtered_ids)} high-impact")
+    if not budget.breached:
+        video_metadata = _fetch_video_metadata(youtube, video_ids, budget)
+        video_metadata = filter_videos_by_public_health_relevance(
+            video_metadata, verbose=verbose
+        )
+        if verbose:
+            print(f"After semantic filter: {len(video_metadata)} public-health-relevant")
 
-    videos_upserted = _upsert_videos(sb, video_metadata, filtered_ids, verbose=verbose)
-    transcripts_saved = _save_transcripts(sb, filtered_ids, verbose=verbose)
-    comments_saved = _save_comments(sb, youtube, filtered_ids, verbose=verbose)
+    if not budget.breached:
+        filtered_ids = _filter_by_impact(
+            video_metadata,
+            min_comments_per_1k=min_comments_per_1k,
+            min_likes_per_1k=min_likes_per_1k,
+            min_views=min_views,
+            percentile=percentile,
+        )
+        if verbose:
+            print(f"After impact filter: {len(filtered_ids)} high-impact")
+
+    if not budget.breached and filtered_ids:
+        videos_upserted = _upsert_videos(
+            sb, video_metadata, filtered_ids, verbose=verbose
+        )
+        transcripts_saved = _save_transcripts(sb, filtered_ids, verbose=verbose)
+        comments_saved = _save_comments(
+            sb,
+            youtube,
+            filtered_ids,
+            budget,
+            max_pages_per_video=max_comment_pages,
+            verbose=verbose,
+        )
 
     if verbose:
         print(
             f"Pipeline complete: {videos_upserted} videos, "
             f"{transcripts_saved} transcripts, {comments_saved} comments"
         )
+        print(budget.summary())
 
     return {
         "video_ids": filtered_ids,
         "videos_upserted": videos_upserted,
         "transcripts_saved": transcripts_saved,
         "comments_saved": comments_saved,
+        "quota_used": budget.used,
+        "quota_budget": budget.budget,
+        "quota_breached": budget.breached,
     }
 
 
