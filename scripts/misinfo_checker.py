@@ -1,8 +1,7 @@
 """
 Healthcare Video Misinformation Checker
-========================================
 Extracts claims from YouTube video transcripts, then checks them using:
-  1. Google Fact Check Tools API (free) -- searches real fact-check articles
+  1. Google Fact Check Tools API -- searches real fact-check articles
   2. Local NLI model (BART-large-MNLI) -- classifies claims as supported/refuted/neutral
   3. Regex patterns for known healthcare misinformation rhetoric
 
@@ -11,6 +10,9 @@ Usage:
     python misinfo_checker.py 1 video_ids.txt          -> from file
     python misinfo_checker.py 2                        -> from supabase
     python misinfo_checker.py --video <VIDEO_ID>       -> single video by ID
+
+
+    checks for each narrative, then compiles an overall risk assessment (low/medium/high) with reasons.
 """
 
 import os
@@ -268,7 +270,7 @@ def classify_claim_type(sentence: str) -> tuple[str, float]:
     return result["labels"][0], round(result["scores"][0], 4)
 
 
-def check_entailment(claim: str, evidence: str = None) -> tuple[str, float]:
+def check_entailment(claim: str, evidence: str | None = None) -> tuple[str, float]:
     """
     Use NLI to check if a claim is supported, refuted, or neutral
     relative to established medical consensus framing.
@@ -411,12 +413,167 @@ def ids_from_file(filepath: str) -> list[str]:
     return ids
 
 
-def ids_from_supabase() -> list[str]:
+def get_supabase_client():
     from supabase import create_client
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("Error: SUPABASE_URL / SUPABASE_KEY not set.")
         sys.exit(1)
-    client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+# Lazily initialized -- avoids loading a second model unless process_claims_table() is called
+_claim_sentiment_pipeline = None
+
+def _get_claim_sentiment_pipeline():
+    global _claim_sentiment_pipeline
+    if _claim_sentiment_pipeline is None:
+        from transformers import pipeline as hf_pipeline
+        print("Loading sentiment model for claims...")
+        _claim_sentiment_pipeline = hf_pipeline(
+            "sentiment-analysis",
+            model="cardiffnlp/twitter-roberta-base-sentiment-latest",
+            top_k=None,
+        )
+    return _claim_sentiment_pipeline
+
+
+def _run_claim_sentiment(claim_text: str) -> tuple[str, float]:
+    """
+    Returns (sentiment_label, sentiment_score).
+    sentiment_label: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL'
+    sentiment_score: float -1.0 to +1.0  (POS_conf - NEG_conf)
+    """
+    pipe = _get_claim_sentiment_pipeline()
+    result = pipe(claim_text[:512])[0]  # list of 3 dicts
+    scores = {r["label"].lower(): r["score"] for r in result}
+    gradient = round(scores.get("positive", 0.0) - scores.get("negative", 0.0), 4)
+    if gradient > 0.1:
+        label = "POSITIVE"
+    elif gradient < -0.1:
+        label = "NEGATIVE"
+    else:
+        label = "NEUTRAL"
+    return label, gradient
+
+
+def _run_fact_check_status(claim_text: str) -> str:
+    """
+    Returns a fact_check_status string: 'false' | 'misleading' | 'true' | 'unverified'
+    based on the top-rated fact-check result from the Google API.
+    """
+    results = search_fact_checks(claim_text, max_results=3)
+    if not results:
+        return "unverified"
+
+    FALSE_WORDS = {"false", "pants on fire", "incorrect", "misleading", "wrong", "inaccurate", "fake"}
+    TRUE_WORDS = {"true", "correct", "accurate", "verified", "mostly true"}
+
+    for fc in results:
+        rating = fc.rating.lower()
+        if any(w in rating for w in FALSE_WORDS):
+            if "mislead" in rating:
+                return "misleading"
+            return "false"
+        if any(w in rating for w in TRUE_WORDS):
+            return "true"
+
+    return "unverified"
+
+
+def _misinfo_label_from_entailment(claim_text: str) -> str:
+    """
+    Derive a misinfo label for a claim using NLI entailment.
+    Returns: 'misinfo' | 'clean' | 'uncertain'
+    """
+    entailment, confidence = check_entailment(claim_text)
+    if entailment == "refuted" and confidence >= 0.6:
+        return "misinfo"
+    elif entailment == "supported" and confidence >= 0.6:
+        return "clean"
+    return "uncertain"
+
+
+# ----------------------------------------------
+# PROCESS CLAIMS TABLE
+# ----------------------------------------------
+
+def process_claims_table(batch_size: int = 50):
+    """
+    Pull rows from the 'claims' table where sentiment_label, sentiment_score,
+    or fact_check_status is NULL, then update each row in place.
+
+    Updates per claim:
+      - sentiment_label  (POSITIVE / NEGATIVE / NEUTRAL)
+      - sentiment_score  (-1.0 to +1.0, true gradient)
+      - fact_check_status  (false / misleading / true / unverified)
+      - llm_confidence   (NLI entailment confidence, 0.0-1.0)
+    """
+    client = get_supabase_client()
+
+    # Fetch unprocessed claims (any of the three fields is null)
+    resp = (
+        client.table("claims")
+        .select("claim_id, claim_text, sentiment_label, sentiment_score, fact_check_status")
+        .or_(
+            "sentiment_label.is.null,"
+            "sentiment_score.is.null,"
+            "fact_check_status.is.null"
+        )
+        .limit(batch_size)
+        .execute()
+    )
+
+    rows = resp.data
+    if not rows:
+        print("No unprocessed claims found.")
+        return
+
+    print(f"Processing {len(rows)} unprocessed claim(s)...\n")
+
+    for i, row in enumerate(rows, 1):
+        claim_id = row["claim_id"]
+        claim_text = row["claim_text"]
+
+        print(f"  [{i}/{len(rows)}] claim_id={claim_id}")
+        print(f"    text: {claim_text[:100]}...")
+
+        updates = {}
+
+        # --- sentiment_label + sentiment_score ---
+        if row["sentiment_label"] is None or row["sentiment_score"] is None:
+            sent_label, sent_score = _run_claim_sentiment(claim_text)
+            updates["sentiment_label"] = sent_label
+            updates["sentiment_score"] = sent_score
+            print(f"    sentiment: {sent_label} ({sent_score:+.4f})")
+
+        # --- fact_check_status ---
+        if row["fact_check_status"] is None:
+            fc_status = _run_fact_check_status(claim_text)
+            updates["fact_check_status"] = fc_status
+            print(f"    fact_check_status: {fc_status}")
+
+        # --- llm_confidence (NLI entailment) ---
+        # Always compute alongside fact check since we're already running NLI
+        entailment_label, entailment_conf = check_entailment(claim_text)
+        misinfo_label = "misinfo" if entailment_label == "refuted" and entailment_conf >= 0.6 else \
+                        "clean" if entailment_label == "supported" and entailment_conf >= 0.6 else \
+                        "uncertain"
+        updates["llm_confidence"] = entailment_conf
+        # Store misinfo label into fact_check_status if it's still unverified and NLI says misinfo
+        if updates.get("fact_check_status") == "unverified" and misinfo_label == "misinfo":
+            updates["fact_check_status"] = "misinfo"
+        print(f"    llm: {entailment_label} ({entailment_conf:.0%}) -> {misinfo_label}")
+
+        # --- Push update to Supabase ---
+        if updates:
+            client.table("claims").update(updates).eq("claim_id", claim_id).execute()
+            print(f"    [OK] Updated claim {claim_id}\n")
+
+    print(f"Done. {len(rows)} claim(s) processed.")
+
+
+def ids_from_supabase() -> list[str]:
+    client = get_supabase_client()
     rows = client.table(SUPABASE_TABLE_VIDEOS).select("video_id").execute()
     return [r["video_id"] for r in rows.data]
 
@@ -426,11 +583,7 @@ def ids_from_supabase_without_misinfo() -> list[str]:
     Pull video IDs from Supabase that do NOT already have a
     misinfo check row in the insights table (model = 'misinfo').
     """
-    from supabase import create_client
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        print("Error: SUPABASE_URL / SUPABASE_KEY not set.")
-        sys.exit(1)
-    client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    client = get_supabase_client()
 
     # All video IDs
     all_videos = client.table(SUPABASE_TABLE_VIDEOS).select("video_id").execute()
@@ -453,13 +606,11 @@ def ids_from_supabase_without_misinfo() -> list[str]:
 def push_misinfo_to_supabase(report: VideoMisinfoReport):
     """
     Push a misinformation report into the insights table.
-    Maps to: video_id, model='misinfo', claims, narratives, labels, confidence
     """
     if report.error:
         return
 
-    from supabase import create_client
-    client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    client = get_supabase_client()
 
     # Build claims JSON -- each analyzed claim with its verdict
     claims_data = []
@@ -572,12 +723,23 @@ def print_report(report: VideoMisinfoReport):
 #   python misinfo_checker.py 1 video_ids.txt          -> from file
 #   python misinfo_checker.py 2                        -> from supabase (all)
 #   python misinfo_checker.py 3                        -> from supabase (only unchecked, auto-push)
+#   python misinfo_checker.py 4                        -> process claims table (fill NULL fields)
 #   python misinfo_checker.py --video <VIDEO_ID>       -> single video by ID
 #   Add --push to any mode to save results to supabase
 #   Add --json to dump full report to misinfo_report.json
 
 if __name__ == "__main__":
     push_to_db = "--push" in sys.argv
+
+    # Mode 4: process claims table directly -- no video pipeline needed
+    if len(sys.argv) > 1 and sys.argv[1] == "4":
+        batch = 50
+        if "--batch" in sys.argv:
+            idx = sys.argv.index("--batch")
+            if idx + 1 < len(sys.argv):
+                batch = int(sys.argv[idx + 1])
+        process_claims_table(batch_size=batch)
+        sys.exit(0)
 
     # Parse --video flag
     if "--video" in sys.argv:

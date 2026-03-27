@@ -24,9 +24,12 @@ SUPABASE_TABLE_VIDEOS = "videos"
 SUPABASE_TABLE_INSIGHTS = "insights"
 
 # MODEL + TRANSCRIPT CLIENT
+# cardiffnlp outputs 3 classes (negative/neutral/positive) so we can compute
+# a true gradient: score = POS_conf - NEG_conf  =>  range -1.0 to +1.0
 sentiment_analyzer = pipeline(
     "sentiment-analysis",
-    model="distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+    model="cardiffnlp/twitter-roberta-base-sentiment-latest",
+    top_k=None,  # return all 3 class scores per chunk
 )
 
 ytt_api = YouTubeTranscriptApi()
@@ -45,55 +48,58 @@ def chunk_text(text: str, chunk_size: int = 300) -> list:
     words = text.split()
     return [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
 
+def chunk_to_gradient(all_class_scores: list) -> float:
+    """
+    Convert cardiffnlp 3-class output to a single gradient score.
+    Input: [{'label': 'negative', 'score': 0.1}, {'label': 'neutral', 'score': 0.2}, {'label': 'positive', 'score': 0.7}]
+    Returns: POS_conf - NEG_conf  =>  range -1.0 to +1.0
+    Neutral confidence is ignored -- it reduces the magnitude naturally since POS+NEG+NEU=1.0
+    """
+    scores = {r["label"].lower(): r["score"] for r in all_class_scores}
+    return round(scores.get("positive", 0.0) - scores.get("negative", 0.0), 4)
+
+
 def analyze_video_sentiment(video_id: str) -> dict:
-    #Fetch -> Clean -> Chunk -> Analyze -> Aggregate
+    # Fetch -> Clean -> Chunk -> Analyze -> Aggregate
     try:
-        # Fetch transcript using v1.x API
         try:
             transcript = ytt_api.fetch(video_id, languages=["en"])
         except Exception:
-            # If English isn't available, grab whatever language exists
             transcript = ytt_api.fetch(video_id)
-        
-        # Clean transcript
+
         cleaned_text = clean_transcript(transcript)
-        
-        # Chunk text
         chunks = chunk_text(cleaned_text)
-        
+
         if not chunks:
             return {"error": "Transcript is empty after cleaning."}
 
-        # Analyze sentiment for each chunk
+        # top_k=None returns all 3 class scores per chunk as a list of lists
         chunk_results = sentiment_analyzer(chunks)
-        
-        # Aggregate the results
-        total_score = 0
-        positive_chunks = 0
-        negative_chunks = 0
-        
-        for result in chunk_results:
-            # The model returns labels 'POSITIVE' or 'NEGATIVE' with a confidence score
-            if result['label'] == 'POSITIVE':
-                positive_chunks += 1
-                total_score += result['score'] # Add confidence
-            else:
-                # Subtract confidence for negative chunks to reflect their impact on overall sentiment
-                negative_chunks += 1
-                total_score -= result['score']
-        
-        #Calculate sentiment
-        avg_score = total_score / len(chunks)
-        overall_sentiment = "POSITIVE" if avg_score > 0 else "NEGATIVE"
-        
+
+        # Convert each chunk's 3-class output to a single -1.0..+1.0 score
+        chunk_scores = [chunk_to_gradient(r) for r in chunk_results]
+
+        positive_chunks = sum(1 for s in chunk_scores if s > 0)
+        negative_chunks = sum(1 for s in chunk_scores if s <= 0)
+        avg_score = round(sum(chunk_scores) / len(chunk_scores), 4)
+
+        # Threshold near zero as NEUTRAL to avoid noise
+        if avg_score > 0.1:
+            overall_sentiment = "POSITIVE"
+        elif avg_score < -0.1:
+            overall_sentiment = "NEGATIVE"
+        else:
+            overall_sentiment = "NEUTRAL"
+
         return {
             "video_id": video_id,
             "overall_sentiment": overall_sentiment,
-            "sentiment_score": round(avg_score, 4), # Range from -1.0 (Highly Negative) to 1.0 (Highly Positive)
+            # True gradient: -1.0 = strongly negative, 0.0 = neutral, +1.0 = strongly positive
+            "sentiment_score": avg_score,
             "total_chunks": len(chunks),
             "positive_chunks": positive_chunks,
             "negative_chunks": negative_chunks,
-            "timeline": chunk_results # Contains the sequential sentiment of the video
+            "timeline": chunk_scores,  # per-chunk gradient scores in order
         }
 
     except Exception as e:
