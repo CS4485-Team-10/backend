@@ -391,24 +391,27 @@ def _run_claim_sentiment(claim_text: str) -> tuple[str, float]:
 
 
 def _run_fact_check_status(claim_text: str) -> str:
-    # returns the verdict from google fact check, or 'unverified' if nothing found
+    # returns the verdict from google fact check, or 'pending' if nothing found
+    # Returns: 'pending', 'verified_true', 'verified_false', 'unverifiable'
     results = search_fact_checks(claim_text, max_results=3)
     if not results:
-        return "unverified"
+        return "pending"
 
     FALSE_WORDS = {"false", "pants on fire", "incorrect", "misleading", "wrong", "inaccurate", "fake"}
     TRUE_WORDS = {"true", "correct", "accurate", "verified", "mostly true"}
+    UNVERIFIABLE_WORDS = {"unverifiable", "unproven", "unclear", "mixed"}
 
     for fc in results:
         rating = fc.rating.lower()
         if any(w in rating for w in FALSE_WORDS):
-            if "mislead" in rating:
-                return "misleading"
-            return "false"
+            return "verified_false"
         if any(w in rating for w in TRUE_WORDS):
-            return "true"
+            return "verified_true"
+        if any(w in rating for w in UNVERIFIABLE_WORDS):
+            return "unverifiable"
 
-    return "unverified"
+    # If we got results but couldn't categorize them, mark as unverifiable
+    return "unverifiable"
 
 
 def _misinfo_label_from_entailment(claim_text: str) -> str:
@@ -421,19 +424,37 @@ def _misinfo_label_from_entailment(claim_text: str) -> str:
     return "uncertain"
 
 
+def _calculate_fact_check_confidence(entailment_confidence: float, has_fact_checks: bool) -> str:
+    """
+    Calculate fact check confidence level based on NLI confidence and fact check availability.
+    Returns: 'high', 'medium', or 'low'
+    """
+    # High confidence: strong NLI confidence (>= 0.75) AND external fact checks found
+    if entailment_confidence >= 0.75 and has_fact_checks:
+        return "high"
+    
+    # Medium confidence: decent NLI confidence (>= 0.5) OR has fact checks
+    if entailment_confidence >= 0.5 or has_fact_checks:
+        return "medium"
+    
+    # Low confidence: weak NLI and no external validation
+    return "low"
+
+
 def process_claims_table(batch_size: int = 50):
-    # pulls claims rows where any of the 3 key fields are null and fills them in
-    # updates: sentiment_label, sentiment_score, fact_check_status, llm_confidence
+    # pulls claims rows where any of the key fields are null and fills them in
+    # updates: sentiment_label, sentiment_score, fact_check_status, fact_check_confidence, llm_confidence
     client = get_supabase_client()
 
-    # Fetch unprocessed claims (any of the three fields is null)
+    # Fetch unprocessed claims (any of the fields is null)
     resp = (
         client.table("claims")
-        .select("claim_id, claim_text, sentiment_label, sentiment_score, fact_check_status")
+        .select("claim_id, claim_text, sentiment_label, sentiment_score, fact_check_status, fact_check_confidence")
         .or_(
             "sentiment_label.is.null,"
             "sentiment_score.is.null,"
-            "fact_check_status.is.null"
+            "fact_check_status.is.null,"
+            "fact_check_confidence.is.null"
         )
         .limit(batch_size)
         .execute()
@@ -468,17 +489,19 @@ def process_claims_table(batch_size: int = 50):
             updates["fact_check_status"] = fc_status
             print(f"    fact_check_status: {fc_status}")
 
-        # --- llm_confidence (NLI entailment) ---
-        # Always compute alongside fact check since we're already running NLI
+        # --- llm_confidence (NLI entailment) + fact_check_confidence ---
+        # Always compute entailment for llm_confidence
         entailment_label, entailment_conf = check_entailment(claim_text)
-        misinfo_label = "misinfo" if entailment_label == "refuted" and entailment_conf >= 0.6 else \
-                        "clean" if entailment_label == "supported" and entailment_conf >= 0.6 else \
-                        "uncertain"
         updates["llm_confidence"] = entailment_conf
-        # Store misinfo label into fact_check_status if it's still unverified and NLI says misinfo
-        if updates.get("fact_check_status") == "unverified" and misinfo_label == "misinfo":
-            updates["fact_check_status"] = "misinfo"
-        print(f"    llm: {entailment_label} ({entailment_conf:.0%}) -> {misinfo_label}")
+        
+        # Calculate fact_check_confidence if null
+        if row["fact_check_confidence"] is None:
+            fact_checks = search_fact_checks(claim_text, max_results=3)
+            confidence = _calculate_fact_check_confidence(entailment_conf, len(fact_checks) > 0)
+            updates["fact_check_confidence"] = confidence
+            print(f"    fact_check_confidence: {confidence}")
+        
+        print(f"    llm_confidence: {entailment_conf:.4f} (entailment: {entailment_label})")
 
         # --- Push update to Supabase ---
         if updates:

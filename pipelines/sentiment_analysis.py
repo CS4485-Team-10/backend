@@ -21,7 +21,6 @@ load_dotenv(Path(__file__).resolve().parent / ".env.example")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 SUPABASE_TABLE_VIDEOS = "videos"
-SUPABASE_TABLE_INSIGHTS = "insights"
 
 # using cardiffnlp because it gives us 3 classes (neg/neu/pos) instead of just pos/neg
 # this lets us compute a real gradient: POS - NEG gives a -1 to +1 range
@@ -132,74 +131,56 @@ def get_supabase_client():
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def ids_from_supabase_without_sentiment() -> list[str]:
-    # get all videos, subtract the ones we already ran sentiment on
+def ids_from_supabase_all_videos() -> list[str]:
+    # get all video IDs from the videos table
     client = get_supabase_client()
-
     all_videos = client.table(SUPABASE_TABLE_VIDEOS).select("video_id").execute()
-    all_ids = {r["video_id"] for r in all_videos.data}
-
-    existing = (
-        client.table(SUPABASE_TABLE_INSIGHTS)
-        .select("video_id")
-        .eq("model", "sentiment")
-        .execute()
-    )
-    done_ids = {r["video_id"] for r in existing.data}
-
-    remaining = list(all_ids - done_ids)
-    print(f"  {len(all_ids)} total videos, {len(done_ids)} already analyzed, {len(remaining)} remaining")
-    return remaining
+    video_ids = [r["video_id"] for r in all_videos.data]
+    print(f"  Found {len(video_ids)} video(s) in database")
+    return video_ids
 
 
-def push_sentiment_to_supabase(result: dict):
-    if "error" in result:
+def save_sentiment_to_json(results: list[dict], output_path: str = "video_sentiment_results.json"):
+    """Save video sentiment results to JSON file for analytics."""
+    if not results:
         return
-
-    client = get_supabase_client()
-
-    row = {
-        "video_id": result["video_id"],
-        "model": "sentiment",
-        "claims": json.dumps([]),
-        "narratives": json.dumps([]),
-        "labels": json.dumps({
-            "overall_sentiment": result["overall_sentiment"],
-            "positive_chunks": result["positive_chunks"],
-            "negative_chunks": result["negative_chunks"],
-            "total_chunks": result["total_chunks"],
-            "timeline": result["timeline"],
-        }),
-        "confidence": abs(result["sentiment_score"]),
-    }
-
-    resp = client.table(SUPABASE_TABLE_INSIGHTS).insert(row).execute()
-    print(f"    [OK] Pushed sentiment for {result['video_id']} to Supabase")
+    
+    # Filter out errors
+    valid_results = [r for r in results if "error" not in r]
+    
+    if not valid_results:
+        print("    [!] No valid results to save")
+        return
+    
+    output_file = Path(output_path)
+    output_file.write_text(json.dumps(valid_results, indent=2))
+    print(f"    [OK] Saved {len(valid_results)} video sentiment result(s) to {output_path}")
 
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else None
-    push_to_db = "--push" in sys.argv
+    save_json = "--save" in sys.argv
+    output_file = "video_sentiment_results.json"
 
     if mode is None:
         video_ids = ["dQw4w9WgXcQ"]
     elif mode == "1":
         if len(sys.argv) < 3:
-            print("Usage: python sentiment_analysis.py 1 <path_to_ids.txt>")
+            print("Usage: python sentiment_analysis.py 1 <path_to_ids.txt> [--save]")
             sys.exit(1)
         video_ids = ids_from_file(sys.argv[2])
     elif mode == "2":
-        video_ids = ids_from_supabase_without_sentiment()
-        push_to_db = True  # always push when pulling from supabase
+        video_ids = ids_from_supabase_all_videos()
+        save_json = True  # always save when pulling from supabase
     else:
-        print(f"Unknown mode '{mode}'. Use: no args | 1 <file> | 2 (supabase)")
+        print(f"Unknown mode '{mode}'. Use: no args | 1 <file> [--save] | 2")
         sys.exit(1)
 
     if not video_ids:
         print("No videos to analyze.")
         sys.exit(0)
 
-    print(f"Analyzing {len(video_ids)} video(s)...  (push_to_db={push_to_db})\n")
+    print(f"Analyzing {len(video_ids)} video(s) for VIDEO-LEVEL sentiment...  (save_json={save_json})\n")
 
     all_results = []
     for vid in video_ids:
@@ -207,9 +188,6 @@ if __name__ == "__main__":
         result = analyze_video_sentiment(vid)
         print_result(result)
         all_results.append(result)
-
-        if push_to_db and "error" not in result:
-            push_sentiment_to_supabase(result)
 
     # Summary
     successes = [r for r in all_results if "error" not in r]
@@ -219,10 +197,13 @@ if __name__ == "__main__":
         print(f"\n{'-' * 50}")
         print(f"Total: {len(all_results)} videos  |  Analyzed: {len(successes)}  |  Failed: {failures}")
         print(f"Average sentiment score: {avg:+.4f}")
+        
+        if save_json:
+            save_sentiment_to_json(all_results, output_file)
     else:
         print(f"\nNo videos could be analyzed ({failures} failed).")
 
 # Usage:
-#   python sentiment_analysis.py                -> test single video (no db push)
-#   python sentiment_analysis.py 1 ids.txt      -> from file (add --push to save)
-#   python sentiment_analysis.py 2              -> from supabase (auto-push)
+#   python sentiment_analysis.py                -> test single video (console output only)
+#   python sentiment_analysis.py 1 ids.txt      -> from file (add --save for JSON output)
+#   python sentiment_analysis.py 2              -> from supabase (auto-save to JSON)
