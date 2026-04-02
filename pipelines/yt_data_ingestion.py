@@ -5,8 +5,7 @@ YouTube Data Ingestion Pipeline.
 2. Semantic filter by public health relevance (LLM-based)
 3. Filter by metadata impact
 4. Pull transcripts via youtube-transcript-api
-5. Pull comments via YouTube Data API
-6. Persist to Supabase (videos, transcripts, comments)
+5. Persist to Supabase (videos, transcripts)
 """
 
 import json
@@ -29,10 +28,8 @@ from pipelines.shared import LLMProvider
 # Source: https://developers.google.com/youtube/v3/determine_quota_cost
 _QUOTA_COST_SEARCH_LIST = 100
 _QUOTA_COST_VIDEOS_LIST = 1
-_QUOTA_COST_COMMENT_THREADS_LIST = 1
 
 _DEFAULT_QUOTA_BUDGET = 9000  # keep a 1000-unit buffer under the 10,000/day default
-_DEFAULT_COMMENTS_MAX_PAGES = 20  # cap per-video comment pagination
 
 # Tuned for ~300+ deduplicated candidate IDs with 6-month window and default pagination.
 _DEFAULT_SEARCH_QUERIES = [
@@ -215,8 +212,8 @@ Return ONLY valid JSON. For each video, output: {"video_id": "...", "is_relevant
 
 
 def _get_llm_provider_for_filtering() -> LLMProvider:
-    """Create LLM provider for semantic filtering from env vars."""
-    model = os.environ.get("LLM_MODEL", "llama3")
+    """Create LLM provider for semantic filtering from YT_SEMANTIC_FILTER_MODEL (default gemma2)."""
+    model = os.environ.get("YT_SEMANTIC_FILTER_MODEL", "gemma2")
     return OllamaProvider(model=model)
 
 
@@ -511,78 +508,12 @@ def _save_transcripts(
                 "transcript_id": str(uuid.uuid4()),
                 "video_id": video_id,
                 "cleaned_transcript_txt": cleaned or "",
-                "raw_transcript_json": {"segments": segments} if segments else {"segments": []},
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }).execute()
             saved += 1
         except Exception as e:
             if verbose:
                 print(f"No transcript for {video_id}: {e}")
-    return saved
-
-
-def _save_comments(
-    sb,
-    youtube,
-    video_ids: List[str],
-    budget: QuotaBudget,
-    *,
-    max_pages_per_video: int = _DEFAULT_COMMENTS_MAX_PAGES,
-    verbose: bool = True,
-) -> int:
-    """Fetch comments and persist to Supabase. Returns count saved.
-
-    Stops processing further videos when the quota budget is exhausted.
-    """
-    saved = 0
-    for idx, video_id in enumerate(video_ids):
-        if budget.breached:
-            if verbose:
-                print(
-                    f"  [quota] stopping comments — "
-                    f"processed {idx}/{len(video_ids)} videos"
-                )
-            break
-        try:
-            comment_items: List[dict] = []
-            page_token = None
-            pages_fetched = 0
-            while pages_fetched < max_pages_per_video:
-                if not budget.try_consume(
-                    _QUOTA_COST_COMMENT_THREADS_LIST,
-                    stage="commentThreads.list",
-                    detail=f"video={video_id} page={pages_fetched + 1}",
-                ):
-                    break
-                resp = (
-                    youtube.commentThreads()
-                    .list(
-                        part="snippet,replies",
-                        videoId=video_id,
-                        order="relevance",
-                        maxResults=100,
-                        pageToken=page_token,
-                    )
-                    .execute()
-                )
-                comment_items.extend(resp.get("items", []))
-                pages_fetched += 1
-                page_token = resp.get("nextPageToken")
-                if not page_token:
-                    break
-            if comment_items:
-                sb.table("comments").upsert(
-                    {
-                        "video_id": video_id,
-                        "comment_threads_json": {"items": comment_items},
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    on_conflict="video_id",
-                ).execute()
-                saved += 1
-        except Exception as e:
-            if verbose:
-                print(f"No comments for {video_id}: {e}")
     return saved
 
 
@@ -595,27 +526,24 @@ def run_youtube_data_ingestion_pipeline(
     min_views: int = 500,
     percentile: float = 0.75,
     quota_budget: Optional[int] = None,
-    comments_max_pages: Optional[int] = None,
     verbose: bool = True,
 ) -> dict:
     """
     Main entrypoint for the YouTube data ingestion pipeline.
 
     Coordinates the full workflow: search for videos, fetch metadata,
-    filter by semantic relevance and impact, then persist videos,
-    transcripts, and comments to Supabase.
+    filter by semantic relevance and impact, then persist videos and
+    transcripts to Supabase.
 
     Args:
         search_queries: List of search terms to fan out across.
             Defaults to _DEFAULT_SEARCH_QUERIES (~10 public-health terms).
         quota_budget: Max YouTube API quota units this run may consume.
             Defaults to env var YT_QUOTA_DAILY_BUDGET_UNITS or 9000.
-        comments_max_pages: Max comment pages fetched per video.
-            Defaults to env var YT_COMMENTS_MAX_PAGES_PER_VIDEO or 20.
 
     Returns:
         dict with keys: video_ids, videos_upserted, transcripts_saved,
-        comments_saved, quota_used, quota_budget, quota_breached
+        quota_used, quota_budget, quota_breached
     """
     load_dotenv()
     api_key = os.getenv("YOUTUBE_DATA_API_KEY")
@@ -629,9 +557,6 @@ def run_youtube_data_ingestion_pipeline(
 
     budget_limit = quota_budget or int(
         os.getenv("YT_QUOTA_DAILY_BUDGET_UNITS", str(_DEFAULT_QUOTA_BUDGET))
-    )
-    max_comment_pages = comments_max_pages or int(
-        os.getenv("YT_COMMENTS_MAX_PAGES_PER_VIDEO", str(_DEFAULT_COMMENTS_MAX_PAGES))
     )
     budget = QuotaBudget(budget=budget_limit)
 
@@ -653,7 +578,6 @@ def run_youtube_data_ingestion_pipeline(
     filtered_ids: List[str] = []
     videos_upserted = 0
     transcripts_saved = 0
-    comments_saved = 0
 
     if not budget.breached:
         video_metadata = _fetch_video_metadata(youtube, video_ids, budget)
@@ -679,19 +603,11 @@ def run_youtube_data_ingestion_pipeline(
             sb, video_metadata, filtered_ids, verbose=verbose
         )
         transcripts_saved = _save_transcripts(sb, filtered_ids, verbose=verbose)
-        comments_saved = _save_comments(
-            sb,
-            youtube,
-            filtered_ids,
-            budget,
-            max_pages_per_video=max_comment_pages,
-            verbose=verbose,
-        )
 
     if verbose:
         print(
             f"Pipeline complete: {videos_upserted} videos, "
-            f"{transcripts_saved} transcripts, {comments_saved} comments"
+            f"{transcripts_saved} transcripts"
         )
         print(budget.summary())
 
@@ -699,7 +615,6 @@ def run_youtube_data_ingestion_pipeline(
         "video_ids": filtered_ids,
         "videos_upserted": videos_upserted,
         "transcripts_saved": transcripts_saved,
-        "comments_saved": comments_saved,
         "quota_used": budget.used,
         "quota_budget": budget.budget,
         "quota_breached": budget.breached,

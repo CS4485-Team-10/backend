@@ -264,7 +264,7 @@ class OllamaProvider(LLMProvider):
 
     def __init__(
         self,
-        model: str = "llama3",
+        model: str = "qwen3",
         base_url: str = "http://localhost:11434/v1",
     ):
         super().__init__(provider="ollama", model=model)
@@ -294,7 +294,9 @@ class OllamaProvider(LLMProvider):
                 pass
             hint = ""
             if "not found" in err_msg.lower():
-                hint = " Run `ollama pull llama3` (or another model) to download a model first."
+                hint = (
+                    " Run `ollama pull <model>` (see LLM_MODEL) to download a model first."
+                )
             raise RuntimeError(
                 f"Ollama API error ({resp.status_code}): {err_msg}.{hint}"
             ) from None
@@ -318,7 +320,7 @@ class BedrockProvider(LLMProvider):
 def _get_provider_from_env() -> LLMProvider:
     """Create LLM provider from LLM_PROVIDER and LLM_MODEL env vars."""
     provider_name = (os.environ.get("LLM_PROVIDER") or "ollama").lower()
-    model = os.environ.get("LLM_MODEL") or "llama3"
+    model = os.environ.get("LLM_MODEL") or "qwen3"
     base_url = os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
 
     if provider_name == "ollama":

@@ -1,27 +1,35 @@
 # YouTube Intelligence Platform — Backend
-## Setup
+
+## Setup (Conda)
+
+```bash
+conda create -n yt-intel-project python=3.12 -y
+conda activate yt-intel-project
+pip install -r requirements.txt
+# Create `.env` with DATABASE_URL, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, etc.
+```
+
+Fill in `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and other keys your app needs in `.env`.
+
+### Alternative: uv + `.venv`
 
 ```bash
 uv venv .venv
 source .venv/bin/activate
 uv pip install -r requirements.txt
-cp .env.example .env  # fill in your Supabase credentials
 ```
 
 ## Development Setup
 
 ```bash
-# Install dev dependencies and configure git hooks
+pip install -r requirements-dev.txt
 bash scripts/setup-hooks.sh
 ```
 
 Or manually:
 
 ```bash
-# Install dev dependencies
-uv pip install -r requirements-dev.txt  # or: pip install -r requirements-dev.txt
-
-# Configure git hooks
+pip install -r requirements-dev.txt
 git config core.hooksPath .githooks
 chmod +x .githooks/pre-commit
 ```
@@ -34,54 +42,57 @@ Migrations live in `alembic/versions/`. The database URL is read from `DATABASE_
 
 ```bash
 # Apply all pending migrations
-uv run alembic upgrade head
+alembic upgrade head
 
 # Generate a new migration after changing models in app/models/
-uv run alembic revision --autogenerate -m "describe your change"
+alembic revision --autogenerate -m "describe your change"
 
 # Check current migration version
-uv run alembic current
+alembic current
 
 # Rollback the last migration
-uv run alembic downgrade -1
+alembic downgrade -1
 ```
+
+If you use `uv`, prefix commands with `uv run` (for example `uv run alembic upgrade head`).
 
 ## Run the server
 
 ```bash
-uv run uvicorn app.main:app --reload
+uvicorn app.main:app --reload
 ```
+
+(With `uv`: `uv run uvicorn app.main:app --reload`.)
 
 ## Data Ingestion Pipeline
 
 ### Setup
-1. Go to Google Console >> Get an API key for YouTube Data API
-2. Initialize a `.env` file with `YOUTUBE_DATA_API_KEY` set up. 
-3. Create a designated virtual env (either via Python natively or Anaconda) and activate it. 
-4. Install the following packages/libraries using the following command:
-    ```bash
-    pip install google-api-python-client youtube-transcript-api python-dotenv
-    ```
-5. Run the notebook (`yt-data-ingestion.ipynb`) to see the full pipeline in action.
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), enable the YouTube Data API and create an API key.
+2. Set `YOUTUBE_DATA_API_KEY` in `.env`.
+3. Activate the **`yt-intel-project`** conda env (or your venv) and install dependencies: `pip install -r requirements.txt` (includes `google-api-python-client`, `youtube-transcript-api`, `python-dotenv`, and the rest of the backend stack).
+4. Run `yt-data-ingestion.ipynb` or import `pipelines.yt_data_ingestion` to run the pipeline in code.
 
 ### LLM Insight Generation (Claims Extraction)
 
-The `llm_insight_generation.ipynb` notebook extracts claims from cleaned transcripts using Ollama.
+The `llm_insight_generation.ipynb` notebook (and `pipelines/llm_insight_generation.py`) extract claims from cleaned transcripts using Ollama.
 
 ### Ollama Setup
 
-1. **Install Ollama**: Download from [ollama.com](https://ollama.com) or run `brew install ollama` (macOS).
-2. **Start Ollama**: Open the Ollama app (macOS) or run `ollama serve` in a terminal.
-3. **Pull a model** (required before running the notebook):
+1. **Install Ollama**: [ollama.com](https://ollama.com) or `brew install ollama` (macOS).
+2. **Start Ollama**: Open the Ollama app or run `ollama serve`.
+3. **Pull the models** used by this repo:
    ```bash
-   ollama pull llama3
+   ollama pull gemma2
+   ollama pull qwen3
    ```
-   Or use another model (e.g. `llama3.2`, `mistral`).
-4. **Optional – use a different model**: Add `LLM_MODEL=llama3.2` to your `.env` (or export it). Default is `llama3`.
+4. **Model selection (defaults)**  
+   - **Claims / insight pipeline** (`llm_insight_generation`): default **`qwen3`**. Override with **`LLM_MODEL`** in `.env`.  
+   - **YouTube ingestion — public-health semantic filter** (`yt_data_ingestion`): default **`gemma2`**. Override with **`YT_SEMANTIC_FILTER_MODEL`** (this is separate from `LLM_MODEL` so insight and ingestion can use different models in the same `.env`).
 
 ### Running the Claims Pipeline
 
-1. Ensure Ollama is running and at least one model is pulled (`ollama list`).
-2. Install dependencies: `pip install -r requirements.txt`
+1. Ensure Ollama is running and the models you need are pulled (`ollama list`).
+2. Dependencies: `pip install -r requirements.txt` (inside `yt-intel-project` or equivalent).
 3. Run all cells in `pipelines/llm_insight_generation.ipynb` from the top.
 4. The test cell extracts claims from `data/transcripts/cleaned/gpzDxm7qflY.txt`.
