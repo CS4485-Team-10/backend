@@ -443,7 +443,7 @@ def _calculate_fact_check_confidence(entailment_confidence: float, has_fact_chec
 
 def process_claims_table(batch_size: int = 50):
     # pulls claims rows where any of the key fields are null and fills them in
-    # updates: sentiment_label, sentiment_score, fact_check_status, fact_check_confidence, llm_confidence
+    # updates: sentiment_label, sentiment_score, fact_check_status, fact_check_confidence
     client = get_supabase_client()
 
     # Fetch unprocessed claims (any of the fields is null)
@@ -489,19 +489,14 @@ def process_claims_table(batch_size: int = 50):
             updates["fact_check_status"] = fc_status
             print(f"    fact_check_status: {fc_status}")
 
-        # --- llm_confidence (NLI entailment) + fact_check_confidence ---
-        # Always compute entailment for llm_confidence
-        entailment_label, entailment_conf = check_entailment(claim_text)
-        updates["llm_confidence"] = entailment_conf
-        
-        # Calculate fact_check_confidence if null
+        # --- fact_check_confidence ---
+        # Calculate fact_check_confidence if null (uses entailment for confidence calculation)
         if row["fact_check_confidence"] is None:
+            entailment_label, entailment_conf = check_entailment(claim_text)
             fact_checks = search_fact_checks(claim_text, max_results=3)
             confidence = _calculate_fact_check_confidence(entailment_conf, len(fact_checks) > 0)
             updates["fact_check_confidence"] = confidence
             print(f"    fact_check_confidence: {confidence}")
-        
-        print(f"    llm_confidence: {entailment_conf:.4f} (entailment: {entailment_label})")
 
         # --- Push update to Supabase ---
         if updates:
