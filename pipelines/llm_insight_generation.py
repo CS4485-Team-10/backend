@@ -108,7 +108,10 @@ def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
     while True:
         page = (
             sb.table("narratives")
-            .select("narrative_id, narrative_label, narrative_risk, narrative_description")
+            .select(
+                "narrative_id, narrative_label, narrative_risk_score, "
+                "narrative_category, narrative_description, narrative_details"
+            )
             .range(offset, offset + _PAGE_SIZE - 1)
             .execute()
         )
@@ -357,8 +360,10 @@ def _persist_insights(
             {
                 "narrative_id": str(n.narrative_id),
                 "narrative_label": n.narrative_label,
-                "narrative_risk": n.narrative_risk,
+                "narrative_risk_score": n.narrative_risk_score,
+                "narrative_category": n.narrative_category,
                 "narrative_description": n.narrative_description,
+                "narrative_details": n.narrative_details,
                 "created_at": now,
             }
             for n in new_narratives

@@ -21,6 +21,22 @@ def _format_views(total: Optional[int]) -> str:
     return str(total)
 
 
+def _claim_status_display(claim: Claim) -> str:
+    if claim.fact_check_status:
+        return claim.fact_check_status
+    if claim.risk_level:
+        return claim.risk_level.title()
+    return "Under Review"
+
+
+def _claim_confidence_display(claim: Claim) -> str:
+    if claim.fact_check_confidence:
+        return claim.fact_check_confidence
+    if claim.llm_confidence is not None:
+        return f"{float(claim.llm_confidence):.2f}"
+    return "—"
+
+
 def _build_claim_response(
     claim: Claim,
     channel_title: Optional[str],
@@ -30,10 +46,8 @@ def _build_claim_response(
         claim_id=str(claim.claim_id)[:8].upper(),
         text=claim.claim_text,
         source=channel_title or "Unknown",
-        # TODO: use claims.verification_status once column exists
-        status="Under Review",
-        # TODO: use claims.confidence_score once column exists
-        confidence="—",
+        status=_claim_status_display(claim),
+        confidence=_claim_confidence_display(claim),
         views=_format_views(view_count),
         date=claim.created_at.strftime("%Y-%m-%d"),
     )

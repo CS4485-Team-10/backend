@@ -46,15 +46,19 @@ class NarrativeCandidate:
 
     narrative_id: uuid.UUID
     narrative_label: str
-    narrative_risk: str
+    narrative_risk_score: float = 5.0
+    narrative_category: str = "Uncategorized"
     narrative_description: Optional[str] = None
+    narrative_details: Optional[str] = None
     is_new: bool = False
 
     @property
     def embed_text(self) -> str:
-        parts = [self.narrative_label]
+        parts = [self.narrative_label, self.narrative_category]
         if self.narrative_description:
             parts.append(self.narrative_description)
+        if self.narrative_details:
+            parts.append(self.narrative_details)
         return " — ".join(parts)
 
 
@@ -160,8 +164,10 @@ def _build_new_narrative(
     return NarrativeCandidate(
         narrative_id=uuid.uuid4(),
         narrative_label=label,
-        narrative_risk="medium",
+        narrative_risk_score=5.0,
+        narrative_category="Uncategorized",
         narrative_description=claim_text[:500] if not theme else claim_text[:500],
+        narrative_details=None,
         is_new=True,
     )
 
@@ -175,19 +181,30 @@ def build_candidate_pool(
     ----------
     existing_rows:
         Dicts with at least ``narrative_id``, ``narrative_label``,
-        ``narrative_risk``, and optionally ``narrative_description``.
+        ``narrative_risk_score`` (or legacy ``narrative_risk``), and optional
+        description/category/details fields.
 
     Returns
     -------
     (candidates, embeddings) — embeddings are L2-normalized (N x D).
     Returns empty arrays when there are no existing rows.
     """
+
+    def _risk_score_from_row(r: Dict[str, Any]) -> float:
+        v = r.get("narrative_risk_score")
+        if v is not None:
+            return float(v)
+        s = str(r.get("narrative_risk", "medium")).lower()
+        return {"high": 8.0, "medium": 5.0, "low": 2.0}.get(s, 5.0)
+
     candidates = [
         NarrativeCandidate(
             narrative_id=uuid.UUID(r["narrative_id"]) if isinstance(r["narrative_id"], str) else r["narrative_id"],
             narrative_label=r["narrative_label"],
-            narrative_risk=r.get("narrative_risk", "medium"),
+            narrative_risk_score=_risk_score_from_row(r),
+            narrative_category=r.get("narrative_category") or "Uncategorized",
             narrative_description=r.get("narrative_description"),
+            narrative_details=r.get("narrative_details"),
         )
         for r in existing_rows
     ]
