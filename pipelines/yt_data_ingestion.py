@@ -12,14 +12,22 @@ import json
 import math
 import os
 import re
+import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Union
 
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from supabase import create_client
 from youtube_transcript_api import YouTubeTranscriptApi
+
+# Running `python pipelines/this_file.py` puts `pipelines/` first on sys.path, so
+# `import pipelines.*` fails. Prepend backend root so package imports resolve.
+_backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
 
 from pipelines.llm_insight_generation import OllamaProvider
 from pipelines.shared import LLMProvider
@@ -87,6 +95,21 @@ def _chunk_video_ids(lst: List[str], n: int):
         yield lst[i : i + n]
 
 
+def _reraise_if_youtube_quota_exceeded(err: HttpError) -> None:
+    """Turn opaque 403 quota errors into a short, actionable message."""
+    if err.resp.status != 403:
+        raise err
+    body = (err.content or b"").decode("utf-8", errors="replace")
+    if "quotaExceeded" in body or "youtube.quota" in body:
+        raise RuntimeError(
+            "YouTube Data API quota exceeded for this API key/project "
+            "(Google daily cap, separate from this script's QuotaBudget). "
+            "Wait for reset (midnight Pacific), raise quota in Cloud Console, "
+            "or reduce search_queries / max_search_pages."
+        ) from err
+    raise err
+
+
 def _fetch_video_metadata(
     youtube, video_ids: List[str], budget: QuotaBudget
 ) -> List[dict]:
@@ -99,15 +122,18 @@ def _fetch_video_metadata(
             detail=f"chunk starting {job[0]}",
         ):
             break
-        resp = (
-            youtube.videos()
-            .list(
-                part="snippet,statistics,contentDetails",
-                id=",".join(job),
-                maxResults=50,
+        try:
+            resp = (
+                youtube.videos()
+                .list(
+                    part="snippet,statistics,contentDetails",
+                    id=",".join(job),
+                    maxResults=50,
+                )
+                .execute()
             )
-            .execute()
-        )
+        except HttpError as e:
+            _reraise_if_youtube_quota_exceeded(e)
         all_items.extend(resp.get("items", []))
     return all_items
 
@@ -144,6 +170,8 @@ def _compute_impact_features(vid_metadata: dict) -> dict:
     return {
         "video_id": vid_metadata["id"],
         "view_count": view_count,
+        "like_count": like_count,
+        "comment_count": comment_count,
         "views_per_day": views_per_day,
         "comments_per_1kviews": comments_per_1kviews,
         "likes_per_1kviews": likes_per_1kviews,
@@ -360,20 +388,23 @@ def _fetch_candidate_video_ids(
                 detail=f"q={query!r} page {page_num + 1}/{max_search_pages}",
             ):
                 break
-            resp = (
-                youtube.search()
-                .list(
-                    q=query,
-                    part="snippet",
-                    type="video",
-                    maxResults=50,
-                    publishedAfter=six_months_ago,
-                    order="viewCount",
-                    relevanceLanguage="en",
-                    pageToken=page_token,
+            try:
+                resp = (
+                    youtube.search()
+                    .list(
+                        q=query,
+                        part="snippet",
+                        type="video",
+                        maxResults=50,
+                        publishedAfter=six_months_ago,
+                        order="viewCount",
+                        relevanceLanguage="en",
+                        pageToken=page_token,
+                    )
+                    .execute()
                 )
-                .execute()
-            )
+            except HttpError as e:
+                _reraise_if_youtube_quota_exceeded(e)
             for item in resp.get("items", []):
                 vid = item.get("id", {}).get("videoId")
                 if vid and item.get("id", {}).get("kind") == "youtube#video":
@@ -396,15 +427,40 @@ def _filter_by_impact(
     min_comments_per_1k: float = 1.0,
     min_likes_per_1k: float = 10,
     min_views: int = 500,
+    min_like_count: int = 25,
+    min_comment_count: int = 5,
     percentile: float = 0.75,
+    verbose: bool = False,
 ) -> List[str]:
-    """Compute impact features, filter by engagement thresholds, return top percentile video IDs."""
+    """Compute impact features, filter by engagement thresholds, return top percentile video IDs.
+
+    Raw minimums (views, likes, comments) block small-sample false positives: per-1k
+    ratios alone can look strong on very low view/engagement counts.
+    """
     impact_metrics = [_compute_impact_features(v) for v in video_metadata]
+    n = len(impact_metrics)
+    raw_excluded = sum(
+        1
+        for v in impact_metrics
+        if not (
+            v["view_count"] >= min_views
+            and v["like_count"] >= min_like_count
+            and v["comment_count"] >= min_comment_count
+        )
+    )
+    if verbose and n:
+        print(
+            f"  [impact] raw floor excluded {raw_excluded}/{n} candidates "
+            f"(before ratio+percentile)"
+        )
+
     eligible = [
         v
         for v in impact_metrics
         if (
             v["view_count"] >= min_views
+            and v["like_count"] >= min_like_count
+            and v["comment_count"] >= min_comment_count
             and v["comments_per_1kviews"] >= min_comments_per_1k
             and v["likes_per_1kviews"] >= min_likes_per_1k
         )
@@ -524,6 +580,8 @@ def run_youtube_data_ingestion_pipeline(
     min_comments_per_1k: float = 1.0,
     min_likes_per_1k: float = 10,
     min_views: int = 500,
+    min_like_count: int = 25,
+    min_comment_count: int = 5,
     percentile: float = 0.75,
     quota_budget: Optional[int] = None,
     verbose: bool = True,
@@ -538,6 +596,8 @@ def run_youtube_data_ingestion_pipeline(
     Args:
         search_queries: List of search terms to fan out across.
             Defaults to _DEFAULT_SEARCH_QUERIES (~10 public-health terms).
+        min_like_count / min_comment_count: Raw engagement floors for the impact
+            gate (with min_views), avoiding high per-1k ratios on tiny samples.
         quota_budget: Max YouTube API quota units this run may consume.
             Defaults to env var YT_QUOTA_DAILY_BUDGET_UNITS or 9000.
 
@@ -593,7 +653,10 @@ def run_youtube_data_ingestion_pipeline(
             min_comments_per_1k=min_comments_per_1k,
             min_likes_per_1k=min_likes_per_1k,
             min_views=min_views,
+            min_like_count=min_like_count,
+            min_comment_count=min_comment_count,
             percentile=percentile,
+            verbose=verbose,
         )
         if verbose:
             print(f"After impact filter: {len(filtered_ids)} high-impact")
