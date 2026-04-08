@@ -4,6 +4,13 @@ LLM Insight Generation Pipeline.
 Reads transcripts from Supabase (only those without existing claims),
 extracts claims via an LLM, semantically matches or creates narratives,
 and persists claims, narratives, and claim_narratives back to Supabase.
+Narrative embeddings are only used for semantic matching/dedup against
+existing narrative rows, not for LLM extraction. Production defaults to
+``NARR_EMBEDDING_BACKEND=remote`` (Google Gemini ``embedContent``): set
+``NARR_EMBEDDING_URL`` to the full ``.../models/<id>:embedContent`` URL,
+``NARR_EMBEDDING_API_KEY`` (Google AI key, ``x-goog-api-key``), and optionally
+``NARR_EMBEDDING_MODEL``, ``NARR_EMBEDDING_TIMEOUT`` (see
+``pipelines.narrative_matching``).
 
 Re-runs are safe: prior claims and bridge rows for a transcript are
 deleted before new ones are inserted (replace semantics for CRON jobs).
@@ -27,6 +34,7 @@ from pipelines.narrative_matching import (
     MatchDecision,
     NarrativeCandidate,
     build_candidate_pool,
+    get_embedder_from_env,
     match_claim_to_narratives,
     refresh_pool_with_new,
 )
@@ -441,7 +449,10 @@ def run_llm_insight_generation_pipeline(
     log.info("Processing %d transcript(s)", len(transcripts))
 
     existing_narr_rows = _fetch_all_narratives(sb)
-    candidates, candidate_embeddings = build_candidate_pool(existing_narr_rows)
+    embedder = get_embedder_from_env()
+    candidates, candidate_embeddings = build_candidate_pool(
+        existing_narr_rows, embedder=embedder
+    )
 
     total_claims = 0
     total_new_narratives = 0
@@ -469,12 +480,20 @@ def run_llm_insight_generation_pipeline(
                     narrative_theme=c.get("narrative_theme"),
                     candidates=candidates,
                     candidate_embeddings=candidate_embeddings,
+                    embedder=embedder,
                 )
                 decisions.append(decision)
+                log.debug(
+                    "Claim match top_similarity=%s",
+                    decision.top_similarity,
+                )
                 if decision.new_narrative:
                     run_new_narratives.append(decision.new_narrative)
                     candidate_embeddings = refresh_pool_with_new(
-                        candidates, candidate_embeddings, decision.new_narrative
+                        candidates,
+                        candidate_embeddings,
+                        decision.new_narrative,
+                        embedder=embedder,
                     )
 
             inserted = _persist_insights(
