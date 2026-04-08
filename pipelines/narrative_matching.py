@@ -19,8 +19,7 @@ Configure via ``NARR_EMBEDDING_BACKEND`` (default: ``remote``):
   Each string in ``encode(texts)`` is embedded with a separate ``embedContent`` call;
   vectors are stacked, validated, and L2-normalized for cosine similarity.
 
-- **sentence_transformers** (optional local dev): requires the ``sentence-transformers``
-  package; uses ``NARR_EMBEDDING_MODEL`` (default ``paraphrase-MiniLM-L3-v2``).
+Only the ``remote`` backend is supported (no local heavyweight embedding stack).
 """
 
 from __future__ import annotations
@@ -46,7 +45,6 @@ MULTI_LINK_THRESHOLD: float = float(os.environ.get("NARR_MULTI_LINK", "0.70"))
 NEW_NARRATIVE_MIN: float = float(os.environ.get("NARR_NEW_MIN", "0.72"))
 MAX_NARRATIVES_PER_CLAIM: int = int(os.environ.get("NARR_MAX_PER_CLAIM", "5"))
 
-_DEFAULT_EMBEDDING_MODEL = "paraphrase-MiniLM-L3-v2"
 _DEFAULT_EMBEDDING_TIMEOUT = 60.0
 
 
@@ -228,65 +226,41 @@ class RemoteEmbedder(BaseEmbedder):
         return _l2_normalize_rows(arr)
 
 
-class SentenceTransformerEmbedder(BaseEmbedder):
-    def __init__(self, model_name: str) -> None:
-        from sentence_transformers import SentenceTransformer
-
-        self._model_name = model_name
-        log.info("Loading embedding model: %s", model_name)
-        self._model = SentenceTransformer(model_name)
-
-    def encode(self, texts: List[str]) -> np.ndarray:
-        return self._model.encode(
-            texts, normalize_embeddings=True, show_progress_bar=False
-        )
-
-
 def get_embedder_from_env() -> BaseEmbedder:
     backend = (
         (os.environ.get("NARR_EMBEDDING_BACKEND") or "remote")
         .lower()
         .replace("-", "_")
     )
+    if backend != "remote":
+        raise ValueError(
+            f"Unsupported NARR_EMBEDDING_BACKEND: {backend!r}. "
+            "Only 'remote' (Google Gemini embedContent) is supported."
+        )
     timeout = float(
         os.environ.get("NARR_EMBEDDING_TIMEOUT", str(_DEFAULT_EMBEDDING_TIMEOUT))
     )
     api_key = os.environ.get("NARR_EMBEDDING_API_KEY") or None
-    embedder: BaseEmbedder
-    url: Optional[str] = None
-    log_model: str
-
-    if backend == "remote":
-        url = os.environ.get("NARR_EMBEDDING_URL", "").strip()
-        if not url:
-            raise ValueError(
-                "NARR_EMBEDDING_URL must be set when NARR_EMBEDDING_BACKEND=remote"
-            )
-        remote_model = os.environ.get("NARR_EMBEDDING_MODEL")
-        log_model = remote_model if remote_model else "(unset)"
-        embedder = RemoteEmbedder(
-            url,
-            model=remote_model or None,
-            api_key=api_key,
-            timeout_seconds=timeout,
-        )
-    elif backend == "sentence_transformers":
-        st_model = os.environ.get("NARR_EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL)
-        log_model = st_model
-        embedder = SentenceTransformerEmbedder(model_name=st_model)
-    else:
+    url = os.environ.get("NARR_EMBEDDING_URL", "").strip()
+    if not url:
         raise ValueError(
-            f"Unknown NARR_EMBEDDING_BACKEND: {backend!r}. "
-            "Use 'remote' or 'sentence_transformers'."
+            "NARR_EMBEDDING_URL must be set (Gemini embedContent endpoint)."
         )
+    remote_model = os.environ.get("NARR_EMBEDDING_MODEL")
+    log_model = remote_model if remote_model else "(unset)"
+    embedder: BaseEmbedder = RemoteEmbedder(
+        url,
+        model=remote_model or None,
+        api_key=api_key,
+        timeout_seconds=timeout,
+    )
 
     log.info(
         "Narrative embedding backend: %s (model=%s)",
         backend,
         log_model,
     )
-    if backend == "remote" and url:
-        log.debug("NARR_EMBEDDING_URL=%s", url)
+    log.debug("NARR_EMBEDDING_URL=%s", url)
 
     return embedder
 
