@@ -22,7 +22,7 @@ from googleapiclient.errors import HttpError
 from supabase import create_client
 from youtube_transcript_api import YouTubeTranscriptApi
 
-from pipelines.llm_insight_generation import OllamaProvider
+from pipelines.llm_insight_generation import BedrockProvider, OllamaProvider
 from pipelines.shared import LLMProvider
 
 # YouTube Data API v3 quota unit costs per request.
@@ -249,9 +249,18 @@ Return ONLY valid JSON in this format:
 
 
 def _get_llm_provider_for_filtering() -> LLMProvider:
-    """Create LLM provider for semantic filtering from YT_SEMANTIC_FILTER_MODEL (default gemma2)."""
+    """Create LLM provider for semantic filtering from YT_SEMANTIC_FILTER_PROVIDER & YT_SEMANTIC_FILTER_MODEL."""
+    provider_name = (os.environ.get("YT_SEMANTIC_FILTER_PROVIDER") or "ollama").lower()
     model = os.environ.get("YT_SEMANTIC_FILTER_MODEL", "gemma2")
-    return OllamaProvider(model=model)
+    
+    if provider_name == "ollama":
+        base_url = os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
+        return OllamaProvider(model=model, base_url=base_url)
+    if provider_name == "bedrock":
+        return BedrockProvider(model=model)
+    raise ValueError(
+        f"Unknown YT_SEMANTIC_FILTER_PROVIDER: {provider_name}. Use 'ollama' or 'bedrock'."
+    )
 
 
 def _parse_semantic_filter_response(raw: str, video_ids: List[str]) -> Dict[str, dict]:
