@@ -1,18 +1,10 @@
-"""
-YouTube Comment Sentiment
-Pulls comments from YouTube videos and runs sentiment analysis on them using DistilBERT.
-
-This is a standalone script for testing viability.
-It does NOT push data to Supabase.
-
-Requirements:
-    pip install google-api-python-client transformers torch
-
-Usage:
-    python comment_sentiment.py                          -> test with default video
-    python comment_sentiment.py <VIDEO_ID>               -> single video
-    python comment_sentiment.py <VIDEO_ID1> <VIDEO_ID2>  -> multiple videos
-"""
+# comment_sentiment.py
+# pulls youtube comments and runs sentiment on them -- standalone test, no db push
+#
+# usage:
+#   python comment_sentiment.py                          -> default test video
+#   python comment_sentiment.py <VIDEO_ID>               -> single video
+#   python comment_sentiment.py <VIDEO_ID> --max 200     -> more comments
 
 import os
 import sys
@@ -32,7 +24,6 @@ load_dotenv(Path(__file__).resolve().parent / ".env.example", override=True)
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 
-# Load sentiment model (same as transcript sentiment)
 print("Loading sentiment model...")
 sentiment_analyzer = pipeline(
     "sentiment-analysis",
@@ -41,16 +32,9 @@ sentiment_analyzer = pipeline(
 print("Model loaded.\n")
 
 
-# ──────────────────────────────────────────────
-# YOUTUBE COMMENTS FETCHER
-# ──────────────────────────────────────────────
-
-
 def fetch_comments(video_id: str, max_comments: int = 100) -> list[dict]:
-    """
-    Fetch top-level comments for a YouTube video using the Data API v3.
-    Returns a list of dicts with 'author', 'text', 'likes', 'published_at'.
-    """
+    # grabs top-level comments via the YouTube Data API v3
+    # returns author, text, likes, published_at for each
     from googleapiclient.discovery import build
 
     if not YOUTUBE_API_KEY:
@@ -100,16 +84,7 @@ def fetch_comments(video_id: str, max_comments: int = 100) -> list[dict]:
 
     return comments
 
-
-# ──────────────────────────────────────────────
-# SENTIMENT ANALYSIS ON COMMENTS
-
-
 def analyze_comment_sentiment(comments: list[dict]) -> dict:
-    """
-    Run sentiment analysis on a list of comment dicts.
-    Returns aggregated stats and per-comment results.
-    """
     if not comments:
         return {"error": "No comments to analyze"}
 
@@ -118,10 +93,7 @@ def analyze_comment_sentiment(comments: list[dict]) -> dict:
     if not texts:
         return {"error": "All comments were empty"}
 
-    # Truncate very long comments (model max is 512 tokens)
-    texts_truncated = [t[:512] for t in texts]
-
-    # Batch inference
+    texts_truncated = [t[:512] for t in texts]  # model cap is 512 tokens
     results = sentiment_analyzer(texts_truncated)
 
     # Attach results back to comments
@@ -173,11 +145,6 @@ def analyze_comment_sentiment(comments: list[dict]) -> dict:
     }
 
 
-# ──────────────────────────────────────────────
-# PRETTY PRINT
-# ──────────────────────────────────────────────
-
-
 def print_comment_analysis(video_id: str, analysis: dict):
     print(f"\n{'=' * 60}")
     print(f"  COMMENT SENTIMENT -- {video_id}")
@@ -212,18 +179,11 @@ def print_comment_analysis(video_id: str, analysis: dict):
     print(f"{'=' * 60}\n")
 
 
-# ──────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────
-
 if __name__ == "__main__":
-    # Default test videos (popular health-related)
-    DEFAULT_TEST_VIDEOS = [
-        "dQw4w9WgXcQ",  # Rick Astley -- just for testing the pipeline works
-    ]
+    DEFAULT_TEST_VIDEOS = ["dQw4w9WgXcQ"]
 
-    # Parse --max first so we can exclude it from video IDs
-    max_comments = 50  # Keep it small for viability test
+    # parse --max before reading video IDs so we don't accidentally treat the number as an ID
+    max_comments = 50
     max_idx = -1
     if "--max" in sys.argv:
         max_idx = sys.argv.index("--max")
@@ -255,7 +215,7 @@ if __name__ == "__main__":
         print(f"  Got {len(comments)} comments")
 
         if comments:
-            print("  Running sentiment analysis...")
+            print(f"  Running sentiment...")
             analysis = analyze_comment_sentiment(comments)
             all_analyses[vid] = analysis
             print_comment_analysis(vid, analysis)
