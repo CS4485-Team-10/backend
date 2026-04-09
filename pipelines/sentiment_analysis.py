@@ -65,8 +65,13 @@ def analyze_video_sentiment(video_id: str) -> dict:
     try:
         # Try Supabase first
         client = get_supabase_client()
-        result = client.table("transcripts").select("cleaned_transcript_txt").eq("video_id", video_id).execute()
-        
+        result = (
+            client.table("transcripts")
+            .select("cleaned_transcript_txt")
+            .eq("video_id", video_id)
+            .execute()
+        )
+
         if result.data and len(result.data) > 0:
             cleaned_text = result.data[0]["cleaned_transcript_txt"]
         else:

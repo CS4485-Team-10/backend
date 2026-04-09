@@ -223,8 +223,13 @@ def fetch_transcript(video_id: str) -> str | None:
     try:
         # Try Supabase first
         client = get_supabase_client()
-        result = client.table("transcripts").select("cleaned_transcript_txt").eq("video_id", video_id).execute()
-        
+        result = (
+            client.table("transcripts")
+            .select("cleaned_transcript_txt")
+            .eq("video_id", video_id)
+            .execute()
+        )
+
         if result.data and len(result.data) > 0:
             text = result.data[0]["cleaned_transcript_txt"]
             # Already cleaned, just return
