@@ -64,9 +64,7 @@ def _validate_embeddings(texts: List[str], arr: np.ndarray) -> None:
     if arr.ndim != 2:
         raise ValueError(f"embeddings must be 2-D, got shape {arr.shape}")
     if arr.shape[0] != len(texts):
-        raise ValueError(
-            f"expected {len(texts)} embedding rows, got {arr.shape[0]}"
-        )
+        raise ValueError(f"expected {len(texts)} embedding rows, got {arr.shape[0]}")
     if not np.isfinite(arr).all():
         raise ValueError("embeddings contain non-finite values")
 
@@ -202,7 +200,9 @@ class RemoteEmbedder(BaseEmbedder):
                 f"Gemini embedding must be 1-D, got shape {vec.shape} ({self._url!r})"
             )
         if not np.isfinite(vec).all():
-            raise RuntimeError(f"Gemini embedding has non-finite values ({self._url!r})")
+            raise RuntimeError(
+                f"Gemini embedding has non-finite values ({self._url!r})"
+            )
         return vec
 
     def encode(self, texts: List[str]) -> np.ndarray:
@@ -233,9 +233,7 @@ class RemoteEmbedder(BaseEmbedder):
 
 def get_embedder_from_env() -> BaseEmbedder:
     backend = (
-        (os.environ.get("NARR_EMBEDDING_BACKEND") or "remote")
-        .lower()
-        .replace("-", "_")
+        (os.environ.get("NARR_EMBEDDING_BACKEND") or "remote").lower().replace("-", "_")
     )
     if backend != "remote":
         raise ValueError(
@@ -324,7 +322,9 @@ def match_claim_to_narratives(
             narrative_description=narrative_description,
             narrative_details=narrative_details,
         )
-        return MatchDecision(linked_narrative_ids=[new_narr.narrative_id], new_narrative=new_narr)
+        return MatchDecision(
+            linked_narrative_ids=[new_narr.narrative_id], new_narrative=new_narr
+        )
 
     query = claim_text if not narrative_theme else f"{claim_text} — {narrative_theme}"
     query_vec = embedder.encode([query])[0]
@@ -375,9 +375,7 @@ def _build_new_narrative(
 ) -> NarrativeCandidate:
     """Build a new narrative from first-pass claim metadata (not used to update existing rows)."""
     label = (
-        narrative_theme
-        if narrative_theme
-        else claim_text[:_MAX_FALLBACK_LABEL_CHARS]
+        narrative_theme if narrative_theme else claim_text[:_MAX_FALLBACK_LABEL_CHARS]
     )
     category = (narrative_category or "").strip() or "Uncategorized"
     return NarrativeCandidate(
@@ -422,7 +420,9 @@ def build_candidate_pool(
 
     candidates = [
         NarrativeCandidate(
-            narrative_id=uuid.UUID(r["narrative_id"]) if isinstance(r["narrative_id"], str) else r["narrative_id"],
+            narrative_id=uuid.UUID(r["narrative_id"])
+            if isinstance(r["narrative_id"], str)
+            else r["narrative_id"],
             narrative_label=r["narrative_label"],
             narrative_risk_score=_risk_score_from_row(r),
             narrative_category=r.get("narrative_category") or "Uncategorized",

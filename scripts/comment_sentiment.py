@@ -47,6 +47,7 @@ print("Model loaded.\n")
 # YOUTUBE COMMENTS FETCHER
 # ──────────────────────────────────────────────
 
+
 def fetch_comments(video_id: str, max_comments: int = 100) -> list[dict]:
     """
     Fetch top-level comments for a YouTube video using the Data API v3.
@@ -86,12 +87,14 @@ def fetch_comments(video_id: str, max_comments: int = 100) -> list[dict]:
 
         for item in response.get("items", []):
             snippet = item["snippet"]["topLevelComment"]["snippet"]
-            comments.append({
-                "author": snippet.get("authorDisplayName", "Unknown"),
-                "text": snippet.get("textDisplay", ""),
-                "likes": snippet.get("likeCount", 0),
-                "published_at": snippet.get("publishedAt", ""),
-            })
+            comments.append(
+                {
+                    "author": snippet.get("authorDisplayName", "Unknown"),
+                    "text": snippet.get("textDisplay", ""),
+                    "likes": snippet.get("likeCount", 0),
+                    "published_at": snippet.get("publishedAt", ""),
+                }
+            )
 
         next_page_token = response.get("nextPageToken")
         if not next_page_token:
@@ -99,8 +102,10 @@ def fetch_comments(video_id: str, max_comments: int = 100) -> list[dict]:
 
     return comments
 
+
 # ──────────────────────────────────────────────
 # SENTIMENT ANALYSIS ON COMMENTS
+
 
 def analyze_comment_sentiment(comments: list[dict]) -> dict:
     """
@@ -124,23 +129,25 @@ def analyze_comment_sentiment(comments: list[dict]) -> dict:
     # Attach results back to comments
     detailed = []
     for i, (comment, result) in enumerate(zip(comments, results)):
-        detailed.append({
-            "author": comment["author"],
-            "text": comment["text"][:200],  # truncate for display
-            "likes": comment["likes"],
-            "sentiment": result["label"],
-            "confidence": round(result["score"], 4),
-        })
+        detailed.append(
+            {
+                "author": comment["author"],
+                "text": comment["text"][:200],  # truncate for display
+                "likes": comment["likes"],
+                "sentiment": result["label"],
+                "confidence": round(result["score"], 4),
+            }
+        )
 
     # Aggregate
     positive = sum(1 for r in results if r["label"] == "POSITIVE")
     negative = sum(1 for r in results if r["label"] == "NEGATIVE")
     total = len(results)
 
-    avg_score = sum(
-        r["score"] if r["label"] == "POSITIVE" else -r["score"]
-        for r in results
-    ) / total
+    avg_score = (
+        sum(r["score"] if r["label"] == "POSITIVE" else -r["score"] for r in results)
+        / total
+    )
 
     # Top positive and negative comments (by confidence)
     sorted_positive = sorted(
@@ -172,6 +179,7 @@ def analyze_comment_sentiment(comments: list[dict]) -> dict:
 # PRETTY PRINT
 # ──────────────────────────────────────────────
 
+
 def print_comment_analysis(video_id: str, analysis: dict):
     print(f"\n{'=' * 60}")
     print(f"  COMMENT SENTIMENT -- {video_id}")
@@ -185,9 +193,11 @@ def print_comment_analysis(video_id: str, analysis: dict):
     icon = "[+]" if label == "POSITIVE" else "[-]"
 
     print(f"  Overall: {icon} {label}  (score: {analysis['avg_sentiment_score']:+.4f})")
-    print(f"  Comments: {analysis['total_comments']}  "
-          f"| pos: {analysis['positive_count']} ({analysis['positive_pct']}%)  "
-          f"| neg: {analysis['negative_count']} ({analysis['negative_pct']}%)")
+    print(
+        f"  Comments: {analysis['total_comments']}  "
+        f"| pos: {analysis['positive_count']} ({analysis['positive_pct']}%)  "
+        f"| neg: {analysis['negative_count']} ({analysis['negative_pct']}%)"
+    )
 
     if analysis["top_positive"]:
         print(f"\n  Top Positive Comments:")
@@ -225,7 +235,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         skip = {max_idx, max_idx + 1} if max_idx >= 0 else set()
         video_ids = [
-            v for i, v in enumerate(sys.argv)
+            v
+            for i, v in enumerate(sys.argv)
             if i > 0 and i not in skip and not v.startswith("--")
         ]
     else:
@@ -234,7 +245,9 @@ if __name__ == "__main__":
     if not video_ids:
         video_ids = DEFAULT_TEST_VIDEOS
 
-    print(f"Fetching up to {max_comments} comments per video for {len(video_ids)} video(s)...\n")
+    print(
+        f"Fetching up to {max_comments} comments per video for {len(video_ids)} video(s)...\n"
+    )
 
     all_analyses = {}
 

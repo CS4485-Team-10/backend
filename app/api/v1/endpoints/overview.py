@@ -2,7 +2,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import text
 from sqlmodel import Session, select, func
 
 from app.core.database import get_session
@@ -45,18 +44,24 @@ def executive_overview(session: Session = Depends(get_session)):
     total_videos = session.exec(select(func.count()).select_from(Video)).one()
 
     videos_current = session.exec(
-        select(func.count()).select_from(Video).where(Video.created_at >= thirty_days_ago)
+        select(func.count())
+        .select_from(Video)
+        .where(Video.created_at >= thirty_days_ago)
     ).one()
     videos_previous = session.exec(
         select(func.count())
         .select_from(Video)
         .where(Video.created_at >= sixty_days_ago, Video.created_at < thirty_days_ago)
     ).one()
-    delta_pct = round((videos_current - videos_previous) / max(videos_previous, 1) * 100)
+    delta_pct = round(
+        (videos_current - videos_previous) / max(videos_previous, 1) * 100
+    )
 
     total_narratives = session.exec(select(func.count()).select_from(Narrative)).one()
     new_narratives = session.exec(
-        select(func.count()).select_from(Narrative).where(Narrative.created_at >= thirty_days_ago)
+        select(func.count())
+        .select_from(Narrative)
+        .where(Narrative.created_at >= thirty_days_ago)
     ).one()
 
     total_claims = session.exec(select(func.count()).select_from(Claim)).one()
@@ -89,7 +94,9 @@ def executive_overview(session: Session = Depends(get_session)):
         ).all()
 
         # Bucket into 2-week intervals
-        buckets: dict[str, dict[str, int]] = defaultdict(lambda: {l: 0 for l in top_labels})
+        buckets: dict[str, dict[str, int]] = defaultdict(
+            lambda: {label: 0 for label in top_labels}
+        )
         for created_at, label in rows:
             bucket_start = ninety_days_ago + timedelta(
                 weeks=2 * ((created_at - ninety_days_ago).days // 14)

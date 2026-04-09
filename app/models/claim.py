@@ -24,7 +24,9 @@ class Claim(SQLModel, table=True):
         default=None, sa_column=Column(Text, nullable=True)
     )
     # Optional: "high" | "medium" | "low"
-    risk_level: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    risk_level: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
     fact_check_confidence: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )

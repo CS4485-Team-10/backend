@@ -24,5 +24,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.add_column("claims", sa.Column("supporting_excerpt", sa.Text(), nullable=True))
-    op.add_column("claims", sa.Column("start_time_seconds", sa.Integer(), nullable=True))
+    op.add_column(
+        "claims", sa.Column("start_time_seconds", sa.Integer(), nullable=True)
+    )
     op.add_column("claims", sa.Column("end_time_seconds", sa.Integer(), nullable=True))

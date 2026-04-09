@@ -61,9 +61,8 @@ def list_claims(
     limit: int = Query(50, ge=1, le=200),
     session: Session = Depends(get_session),
 ):
-    statement = (
-        select(Claim, Video.channel_title, Video.view_count)
-        .join(Video, Claim.video_id == Video.video_id)
+    statement = select(Claim, Video.channel_title, Video.view_count).join(
+        Video, Claim.video_id == Video.video_id
     )
 
     count_stmt = select(func.count()).select_from(Claim)

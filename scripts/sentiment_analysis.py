@@ -34,19 +34,24 @@ sentiment_analyzer = pipeline(
 
 ytt_api = YouTubeTranscriptApi()
 
+
 def clean_transcript(transcript) -> str:
     text = " ".join([snippet.text for snippet in transcript.snippets])
-    text = re.sub(r'\[[^\\]]*\]', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\([^)]*\)', '', text)
-    for pattern in [r'\b(?:um|uh|ugh|hmm)\b', r'\byou\s+know\b']:
-        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r"\[[^\\]]*\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\([^)]*\)", "", text)
+    for pattern in [r"\b(?:um|uh|ugh|hmm)\b", r"\byou\s+know\b"]:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
+
 def chunk_text(text: str, chunk_size: int = 300) -> list:
-    #Splits the text into chunks of 300 words
+    # Splits the text into chunks of 300 words
     words = text.split()
-    return [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+    return [
+        " ".join(words[i : i + chunk_size]) for i in range(0, len(words), chunk_size)
+    ]
+
 
 def chunk_to_gradient(all_class_scores: list) -> float:
     """
@@ -120,6 +125,7 @@ def ids_from_file(filepath: str) -> list[str]:
             ids.append(line)
     return ids
 
+
 def print_result(result: dict):
     """Print only the important stuff."""
     if "error" in result:
@@ -137,8 +143,10 @@ def print_result(result: dict):
 # SUPABASE HELPERS
 # ----------------------------------------------
 
+
 def get_supabase_client():
     from supabase import create_client
+
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("Error: SUPABASE_URL / SUPABASE_KEY not set.")
         sys.exit(1)
@@ -166,7 +174,9 @@ def ids_from_supabase_without_sentiment() -> list[str]:
     done_ids = {r["video_id"] for r in existing.data}
 
     remaining = list(all_ids - done_ids)
-    print(f"  {len(all_ids)} total videos, {len(done_ids)} already analyzed, {len(remaining)} remaining")
+    print(
+        f"  {len(all_ids)} total videos, {len(done_ids)} already analyzed, {len(remaining)} remaining"
+    )
     return remaining
 
 
@@ -185,13 +195,15 @@ def push_sentiment_to_supabase(result: dict):
         "model": "sentiment",
         "claims": json.dumps([]),  # not applicable for sentiment
         "narratives": json.dumps([]),  # not applicable for sentiment
-        "labels": json.dumps({
-            "overall_sentiment": result["overall_sentiment"],
-            "positive_chunks": result["positive_chunks"],
-            "negative_chunks": result["negative_chunks"],
-            "total_chunks": result["total_chunks"],
-            "timeline": result["timeline"],
-        }),
+        "labels": json.dumps(
+            {
+                "overall_sentiment": result["overall_sentiment"],
+                "positive_chunks": result["positive_chunks"],
+                "negative_chunks": result["negative_chunks"],
+                "total_chunks": result["total_chunks"],
+                "timeline": result["timeline"],
+            }
+        ),
         "confidence": abs(result["sentiment_score"]),  # 0-1 confidence
     }
 
@@ -247,7 +259,9 @@ if __name__ == "__main__":
     if successes:
         avg = sum(r["sentiment_score"] for r in successes) / len(successes)
         print(f"\n{'-' * 50}")
-        print(f"Total: {len(all_results)} videos  |  Analyzed: {len(successes)}  |  Failed: {failures}")
+        print(
+            f"Total: {len(all_results)} videos  |  Analyzed: {len(successes)}  |  Failed: {failures}"
+        )
         print(f"Average sentiment score: {avg:+.4f}")
     else:
         print(f"\nNo videos could be analyzed ({failures} failed).")

@@ -191,9 +191,7 @@ def _fetch_transcripts_without_claims(sb) -> List[Dict[str, Any]]:
             break
         offset += _PAGE_SIZE
 
-    return [
-        t for t in all_transcripts if str(t["transcript_id"]) not in claimed_ids
-    ]
+    return [t for t in all_transcripts if str(t["transcript_id"]) not in claimed_ids]
 
 
 def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
@@ -375,7 +373,6 @@ Transcript:
 """
 
 
-
 def _validate_json_output(text: str) -> Dict[str, Any]:
     """Parse and validate the LLM JSON output."""
     try:
@@ -479,9 +476,7 @@ class OllamaProvider(LLMProvider):
                 pass
             hint = ""
             if "not found" in err_msg.lower():
-                hint = (
-                    " Run `ollama pull <model>` (see LLM_MODEL) to download a model first."
-                )
+                hint = " Run `ollama pull <model>` (see LLM_MODEL) to download a model first."
             raise RuntimeError(
                 f"Ollama API error ({resp.status_code}): {err_msg}.{hint}"
             ) from None

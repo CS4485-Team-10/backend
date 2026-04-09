@@ -18,7 +18,16 @@ def _encode_password_in_url(url: str) -> str:
         netloc = f"{p.username}:{encoded}@{p.hostname}"
         if p.port:
             netloc += f":{p.port}"
-        return urlunparse((p.scheme, netloc, p.path or "/", p.params or "", p.query or "", p.fragment or ""))
+        return urlunparse(
+            (
+                p.scheme,
+                netloc,
+                p.path or "/",
+                p.params or "",
+                p.query or "",
+                p.fragment or "",
+            )
+        )
     except Exception:
         return url
 
