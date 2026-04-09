@@ -1,5 +1,9 @@
 """Semantic narrative matching for claim → narrative assignment.
 
+When the LLM pipeline creates a **new** narrative, optional first-pass fields
+(``narrative_category``, ``narrative_description``, ``narrative_details``) populate
+that insert; linking to an existing narrative never updates the stored row.
+
 Compares each claim against existing narratives using sentence embeddings
 and cosine similarity, then decides whether to reuse existing narratives
 or create new ones. Supports many-to-many linking (one claim can map to
@@ -86,6 +90,7 @@ class NarrativeCandidate:
 
     @property
     def embed_text(self) -> str:
+        """Text used for narrative embedding (label, category, optional description/details)."""
         parts = [self.narrative_label, self.narrative_category]
         if self.narrative_description:
             parts.append(self.narrative_description)
@@ -285,6 +290,9 @@ def match_claim_to_narratives(
     candidate_embeddings: np.ndarray,
     *,
     embedder: BaseEmbedder,
+    narrative_category: Optional[str] = None,
+    narrative_description: Optional[str] = None,
+    narrative_details: Optional[str] = None,
 ) -> MatchDecision:
     """Decide which existing narratives a claim links to, or create a new one.
 
@@ -300,13 +308,22 @@ def match_claim_to_narratives(
         Pre-computed embeddings for *candidates*, same order / length.
     embedder:
         Encoder used to embed the claim (+ theme) for similarity against the pool.
+    narrative_category, narrative_description, narrative_details:
+        Optional first-pass narrative metadata used only when creating a *new*
+        narrative row. They do not update existing narrative rows when a match is found.
 
     Returns
     -------
     MatchDecision with linked IDs and optionally a new NarrativeCandidate.
     """
     if not candidates:
-        new_narr = _build_new_narrative(claim_text, narrative_theme)
+        new_narr = _build_new_narrative(
+            claim_text,
+            narrative_theme=narrative_theme,
+            narrative_category=narrative_category,
+            narrative_description=narrative_description,
+            narrative_details=narrative_details,
+        )
         return MatchDecision(linked_narrative_ids=[new_narr.narrative_id], new_narrative=new_narr)
 
     query = claim_text if not narrative_theme else f"{claim_text} — {narrative_theme}"
@@ -323,7 +340,13 @@ def match_claim_to_narratives(
             linked_ids.append(candidates[idx].narrative_id)
 
     if max_sim < NEW_NARRATIVE_MIN:
-        new_narr = _build_new_narrative(claim_text, narrative_theme)
+        new_narr = _build_new_narrative(
+            claim_text,
+            narrative_theme=narrative_theme,
+            narrative_category=narrative_category,
+            narrative_description=narrative_description,
+            narrative_details=narrative_details,
+        )
         linked_ids.append(new_narr.narrative_id)
         return MatchDecision(
             linked_narrative_ids=linked_ids,
@@ -339,17 +362,31 @@ def match_claim_to_narratives(
 # ---------------------------------------------------------------------------
 
 
+_MAX_FALLBACK_LABEL_CHARS = 120
+
+
 def _build_new_narrative(
-    claim_text: str, theme: Optional[str]
+    claim_text: str,
+    *,
+    narrative_theme: Optional[str] = None,
+    narrative_category: Optional[str] = None,
+    narrative_description: Optional[str] = None,
+    narrative_details: Optional[str] = None,
 ) -> NarrativeCandidate:
-    label = theme if theme else claim_text[:120]
+    """Build a new narrative from first-pass claim metadata (not used to update existing rows)."""
+    label = (
+        narrative_theme
+        if narrative_theme
+        else claim_text[:_MAX_FALLBACK_LABEL_CHARS]
+    )
+    category = (narrative_category or "").strip() or "Uncategorized"
     return NarrativeCandidate(
         narrative_id=uuid.uuid4(),
         narrative_label=label,
         narrative_risk_score=5.0,
-        narrative_category="Uncategorized",
-        narrative_description=claim_text[:500] if not theme else claim_text[:500],
-        narrative_details=None,
+        narrative_category=category,
+        narrative_description=narrative_description,
+        narrative_details=narrative_details,
         is_new=True,
     )
 

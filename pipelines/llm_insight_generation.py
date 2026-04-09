@@ -4,6 +4,11 @@ LLM Insight Generation Pipeline.
 Reads transcripts from Supabase (only those without existing claims),
 extracts claims via an LLM, semantically matches or creates narratives,
 and persists claims, narratives, and claim_narratives back to Supabase.
+
+**First-pass ownership:** this module normalizes LLM JSON, writes ``claim_text`` and
+``llm_confidence``, and inserts *new* narrative rows from extraction metadata when
+no semantic match exists. Sentiment, fact-check, and risk enrichment are owned by
+other pipelines and are not applied here.
 Narrative embeddings are only used for semantic matching/dedup against
 existing narrative rows, not for LLM extraction. Production defaults to
 ``NARR_EMBEDDING_BACKEND=remote`` (Google Gemini ``embedContent``): set
@@ -20,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import uuid
 from datetime import datetime, timezone
@@ -52,6 +58,87 @@ SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 _PAGE_SIZE = 1000
+
+# Defensive max lengths for parsed LLM fields (downstream of JSON only; prompts unchanged).
+_MAX_CLAIM_TEXT_CHARS = 100_000
+_MAX_NARRATIVE_THEME_CHARS = 500
+_MAX_NARRATIVE_CATEGORY_CHARS = 200
+_MAX_NARRATIVE_DESCRIPTION_CHARS = 4_000
+_MAX_NARRATIVE_DETAILS_CHARS = 8_000
+
+_DEFAULT_NARRATIVE_CATEGORY = "Uncategorized"
+
+
+def _clip_str(value: str, max_len: int) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[:max_len]
+
+
+def _normalize_optional_str(raw: Any, max_len: int) -> Optional[str]:
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    return _clip_str(s, max_len)
+
+
+def _normalize_confidence(raw: Any) -> Optional[float]:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+def _normalize_parsed_claim(raw: Any) -> Optional[Dict[str, Any]]:
+    """Return a canonical claim dict, or None if the entry is unusable."""
+    if not isinstance(raw, dict):
+        log.debug("Skipping non-dict claim entry: %s", type(raw).__name__)
+        return None
+
+    text_raw = raw.get("text")
+    if text_raw is None:
+        text_raw = ""
+    elif not isinstance(text_raw, str):
+        text_raw = str(text_raw)
+    text = _clip_str(text_raw.strip(), _MAX_CLAIM_TEXT_CHARS)
+    if not text:
+        return None
+
+    category = _normalize_optional_str(
+        raw.get("narrative_category"), _MAX_NARRATIVE_CATEGORY_CHARS
+    )
+    if not category:
+        category = _DEFAULT_NARRATIVE_CATEGORY
+
+    return {
+        "text": text,
+        "confidence": _normalize_confidence(raw.get("confidence")),
+        "narrative_theme": _normalize_optional_str(
+            raw.get("narrative_theme"), _MAX_NARRATIVE_THEME_CHARS
+        ),
+        "narrative_category": category,
+        "narrative_description": _normalize_optional_str(
+            raw.get("narrative_description"), _MAX_NARRATIVE_DESCRIPTION_CHARS
+        ),
+        "narrative_details": _normalize_optional_str(
+            raw.get("narrative_details"), _MAX_NARRATIVE_DETAILS_CHARS
+        ),
+    }
 
 
 def _get_supabase():
@@ -179,9 +266,11 @@ def _chunk_text(text: str, max_chars: int = 12000) -> List[str]:
     return chunks if chunks else [text]
 
 
-_SYSTEM = """You extract GENERALIZABLE HEALTH-RELATED CLAIMS from transcripts.
+_SYSTEM = """You extract GENERALIZABLE HEALTH-RELATED CLAIMS from video transcripts.
 
 Your job is to identify only claims that are useful for health insight analysis, misinformation detection, or narrative grouping.
+For each valid claim, also generate reusable narrative metadata:
+`narrative_theme`, `narrative_category`, `narrative_description`, and `narrative_details`.
 
 INCLUDE ONLY:
 - Claims about health, disease, symptoms, diagnosis, treatment, prevention, medication, side effects, risk factors, sleep, mental health, biology, or healthcare systems
@@ -215,10 +304,19 @@ _SCHEMA_HINT = """
     {
       "text": "A concise, generalizable health-related claim (not a personal anecdote or motivational statement)",
       "confidence": 0.0,
-      "narrative_theme": "A short, reusable health topic label (e.g., Sleep Deprivation Risks, ADHD and Substance Use, Vaccine Skepticism)"
+      "narrative_theme": "A short, reusable health topic label (e.g., Sleep Deprivation Risks, ADHD and Substance Use, Vaccine Skepticism)",
+      "narrative_category": "A coarse health category (e.g., Sleep, Mental Health, Vaccines, Chronic Disease, Healthcare Systems)",
+      "narrative_description": "A concise 1-2 sentence summary of the overarching health narrative",
+      "narrative_details": "A slightly richer explanation describing the kinds of claims, mechanisms, risks, or themes that belong under this narrative"
     }
   ]
 }
+
+Confidence properties:
+- "confidence" must be a float between 0.0 and 1.0
+- 1.0 = very confident this is a clear, valid, well-formed claim
+- 0.0 = very low confidence or ambiguous claim
+
 """.strip()
 
 
@@ -235,25 +333,37 @@ Rules:
 - Do NOT extract duplicate or near-duplicate claims
 - Prefer concise, normalized wording over dramatic or conversational phrasing
 
-Rules for generating "narrative_theme":
-- Use a short topic label, not a sentence
-- Make it reusable across multiple similar claims
+Rules for generating narrative metadata:
+- "narrative_theme" must be a short topic label, not a sentence
+- Make "narrative_theme" reusable across multiple similar claims
 - Focus on the underlying health topic, not the speaker, tone, or sequence
 - Avoid generic labels like "Personal History", "Initial Effects", "Long-term Effects", "Encouragement"
 - Avoid overly narrow labels that only fit one claim
-- Good examples:
-  - Sleep Deprivation Risks
-  - ADHD and Substance Use
-  - Vaccine Skepticism
-  - Graves Disease Causes and Triggers
-  - Teen Sleep and School Start Times
-  - Mental Health Overprescription
-- Bad examples:
-  - My Journey
-  - Initial Effects
-  - Important Truth
-  - Encouragement
-  - Healing
+
+- "narrative_category" must be a coarse reusable health bucket such as:
+  Sleep, Mental Health, Vaccines, Chronic Disease, Healthcare Systems, Nutrition, Medications, Public Health, Addiction, Endocrine Health
+- Use "Uncategorized" only if no reasonable category fits
+
+- "narrative_description" should be a concise 1-2 sentence summary of the broader health narrative
+- "narrative_details" should be a slightly richer explanation of the types of claims, mechanisms, risks, or health ideas that belong under that narrative
+- Do not make description/details speaker-specific
+- Do not make description/details motivational or vague
+- Keep both description and details generalizable and health-relevant
+
+Good examples of narrative_theme:
+- Sleep Deprivation Risks
+- ADHD and Substance Use
+- Vaccine Skepticism
+- Graves Disease Causes and Triggers
+- Teen Sleep and School Start Times
+- Mental Health Overprescription
+
+Bad examples of narrative_theme:
+- My Journey
+- Initial Effects
+- Important Truth
+- Encouragement
+- Healing
 
 If there are no valid generalizable health-related claims, return:
 {{"claims": []}}
@@ -263,6 +373,8 @@ Transcript:
 {transcript_chunk}
 ---
 """
+
+
 
 def _validate_json_output(text: str) -> Dict[str, Any]:
     """Parse and validate the LLM JSON output."""
@@ -287,9 +399,14 @@ def _extract_claims(
     max_chars: int = 12000,
     retries: int = 2,
 ) -> List[Dict[str, Any]]:
-    """Chunk transcript, call LLM per chunk, dedupe and return claims."""
+    """Chunk transcript, call LLM per chunk, normalize, dedupe, and return claims.
+
+    Each list item is a canonical dict (see :func:`_normalize_parsed_claim`).
+    Dedupe uses normalized ``text``; **first occurrence wins** for narrative
+    metadata when the same text appears in multiple chunks.
+    """
     chunks = _chunk_text(transcript_text, max_chars=max_chars)
-    all_claims: List[Dict[str, Any]] = []
+    raw_items: List[Any] = []
 
     for chunk in chunks:
         user_prompt = _build_user_prompt(chunk)
@@ -300,7 +417,7 @@ def _extract_claims(
                     system=_SYSTEM, user_prompt=user_prompt
                 )
                 parsed = _validate_json_output(raw)
-                all_claims.extend(parsed.get("claims", []))
+                raw_items.extend(parsed.get("claims", []))
                 break
             except Exception as e:
                 last_error = e
@@ -309,11 +426,14 @@ def _extract_claims(
 
     seen: set[str] = set()
     unique: List[Dict[str, Any]] = []
-    for c in all_claims:
-        t = c.get("text", "")
-        if t and t not in seen:
-            seen.add(t)
-            unique.append(c)
+    for item in raw_items:
+        norm = _normalize_parsed_claim(item)
+        if norm is None:
+            continue
+        key = norm["text"]
+        if key not in seen:
+            seen.add(key)
+            unique.append(norm)
     return unique
 
 
@@ -412,11 +532,26 @@ def _persist_insights(
 ) -> int:
     """Insert narratives, claims, and claim_narratives to Supabase.
 
+    *claims* must be canonical dicts from :func:`_normalize_parsed_claim` (``text``,
+    ``confidence``, narrative keys). *narrative_assignments* must be parallel to
+    *claims* and list :class:`~pipelines.narrative_matching.MatchDecision` in the
+    same order so ``zip(claim_ids, narrative_assignments)`` aligns bridge rows.
+
+    Row payloads use these Supabase columns:
+    ``claims``: ``claim_id``, ``video_id``, ``transcript_id``, ``claim_text``,
+    ``llm_confidence``, ``created_at``. ``narratives``: ``narrative_id``,
+    ``narrative_label``, ``narrative_risk_score``, ``narrative_category``,
+    ``narrative_description``, ``narrative_details``, ``created_at``.
+    ``claim_narratives``: ``claim_id``, ``narrative_id``, ``created_at``.
+
+    When a claim matched an *existing* narrative, that narrative row is not updated
+    here; only bridge rows link the new claim to the existing ``narrative_id``.
+
     Returns the number of claims inserted.
     """
     now = datetime.now(timezone.utc).isoformat()
 
-    # 1. Insert new narratives
+    # 1. Insert new narratives (only rows created in this run; see MatchDecision.new_narrative)
     if new_narratives:
         narr_rows = [
             {
@@ -484,6 +619,11 @@ def run_llm_insight_generation_pipeline(
     Safe for repeated / CRON invocations: existing claims for a
     transcript are deleted before re-inserting (replace semantics).
 
+    Semantic matches attach claims to **existing** narrative rows without
+    rewriting those rows; extraction-only narrative metadata is consumed when
+    :func:`pipelines.narrative_matching.match_claim_to_narratives` creates a **new**
+    narrative.
+
     Run locally:
         conda activate yt-intel-project
         python -m pipelines.llm_insight_generation
@@ -535,6 +675,9 @@ def run_llm_insight_generation_pipeline(
                     candidates=candidates,
                     candidate_embeddings=candidate_embeddings,
                     embedder=embedder,
+                    narrative_category=c.get("narrative_category"),
+                    narrative_description=c.get("narrative_description"),
+                    narrative_details=c.get("narrative_details"),
                 )
                 decisions.append(decision)
                 log.debug(
