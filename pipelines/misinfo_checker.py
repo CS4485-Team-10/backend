@@ -32,7 +32,7 @@ from transformers import pipeline as hf_pipeline
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("torch").setLevel(logging.ERROR)
 
-load_dotenv(Path(__file__).resolve().parent / ".env.example")
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 GOOGLE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -218,15 +218,29 @@ class VideoMisinfoReport:
 
 
 def fetch_transcript(video_id: str) -> str | None:
-    # try english first, fall back to whatever's available
+    # First try to get transcript from Supabase, fall back to YouTube if not found
     # returns None if no transcript at all
     try:
-        try:
-            transcript = ytt_api.fetch(video_id, languages=["en"])
-        except Exception:
-            transcript = ytt_api.fetch(video_id)
+        # Try Supabase first
+        client = get_supabase_client()
+        result = (
+            client.table("transcripts")
+            .select("cleaned_transcript_txt")
+            .eq("video_id", video_id)
+            .execute()
+        )
 
-        text = " ".join(s.text for s in transcript.snippets)
+        if result.data and len(result.data) > 0:
+            text = result.data[0]["cleaned_transcript_txt"]
+            # Already cleaned, just return
+        else:
+            # Fall back to YouTube API
+            try:
+                transcript = ytt_api.fetch(video_id, languages=["en"])
+            except Exception:
+                transcript = ytt_api.fetch(video_id)
+
+            text = " ".join(s.text for s in transcript.snippets)
         # Clean
         text = re.sub(r"\[[^\]]*\]", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\([^)]*\)", "", text)

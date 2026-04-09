@@ -21,3 +21,4 @@ python-dotenv
 youtube-transcript-api
 uvicorn[standard]==0.34.3
 numpy
+boto3>=1.34.0

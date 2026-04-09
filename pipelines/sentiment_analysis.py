@@ -17,7 +17,7 @@ from transformers import pipeline
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("torch").setLevel(logging.ERROR)
 
-load_dotenv(Path(__file__).resolve().parent / ".env.example")
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -61,14 +61,26 @@ def chunk_to_gradient(all_class_scores: list) -> float:
 
 
 def analyze_video_sentiment(video_id: str) -> dict:
-    # try english first, fall back to whatever's available
+    # First try to get transcript from Supabase, fall back to YouTube if not found
     try:
-        try:
-            transcript = ytt_api.fetch(video_id, languages=["en"])
-        except Exception:
-            transcript = ytt_api.fetch(video_id)
+        # Try Supabase first
+        client = get_supabase_client()
+        result = (
+            client.table("transcripts")
+            .select("cleaned_transcript_txt")
+            .eq("video_id", video_id)
+            .execute()
+        )
 
-        cleaned_text = clean_transcript(transcript)
+        if result.data and len(result.data) > 0:
+            cleaned_text = result.data[0]["cleaned_transcript_txt"]
+        else:
+            # Fall back to YouTube API
+            try:
+                transcript = ytt_api.fetch(video_id, languages=["en"])
+            except Exception:
+                transcript = ytt_api.fetch(video_id)
+            cleaned_text = clean_transcript(transcript)
         chunks = chunk_text(cleaned_text)
 
         if not chunks:
