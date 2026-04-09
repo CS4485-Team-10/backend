@@ -1,22 +1,22 @@
-"""
-Healthcare Video Misinformation Checker
-Extracts claims from YouTube video transcripts, then checks them using:
-  1. Google Fact Check Tools API -- searches real fact-check articles
-  2. Local NLI model (BART-large-MNLI) -- classifies claims as supported/refuted/neutral
-  3. Regex patterns for known healthcare misinformation rhetoric
+# misinfo_checker.py
+# pulls transcripts from youtube videos and checks them for health misinformation
+# three approaches: regex pattern matching, google fact check api, and NLI entailment
+#
+# modes:
+#   python misinfo_checker.py                 -> test on a default video
+#   python misinfo_checker.py 1 ids.txt       -> from a file
+#   python misinfo_checker.py 2               -> all videos from supabase
+#   python misinfo_checker.py 3               -> only unchecked videos, auto-push to db
+#   python misinfo_checker.py 4               -> fill NULL fields in the claims table
+#   python misinfo_checker.py --video <ID>    -> single video by id
 
-Usage:
-    python misinfo_checker.py                          -> test video
-    python misinfo_checker.py 1 video_ids.txt          -> from file
-    python misinfo_checker.py 2                        -> from supabase
-    python misinfo_checker.py --video <VIDEO_ID>       -> single video by ID
-
-
-    checks for each narrative, then compiles an overall risk assessment (low/medium/high) with reasons.
-"""
-
+# Suppress noisy model output first (before any transformers imports)
 import os
 import sys
+
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import re
 import json
 import logging
@@ -26,18 +26,11 @@ from dataclasses import dataclass, field, asdict
 import requests
 from youtube_transcript_api import YouTubeTranscriptApi
 from dotenv import load_dotenv
+from transformers import pipeline
+from transformers import pipeline as hf_pipeline
 
-# Suppress noisy model output
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("torch").setLevel(logging.ERROR)
-
-from transformers import pipeline
-
-# ----------------------------------------------
-# CONFIG
-# ----------------------------------------------
 
 load_dotenv(Path(__file__).resolve().parent / ".env.example")
 
@@ -49,12 +42,8 @@ SUPABASE_TABLE_INSIGHTS = "insights"
 
 FACT_CHECK_API_URL = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
 
-# ----------------------------------------------
-# MODELS (loaded once at import time)
-# ----------------------------------------------
-
-# Zero-shot NLI -- used for claim extraction, stance, and entailment
-nli_model = pipeline(
+# zero-shot NLI -- handles claim extraction, stance, entailment
+nli_model = pipeline(  # type: ignore[call-overload]
     "zero-shot-classification",
     model="facebook/bart-large-mnli",
 )
@@ -62,53 +51,116 @@ nli_model = pipeline(
 # Transcript client
 ytt_api = YouTubeTranscriptApi()
 
-# ----------------------------------------------
-# KNOWN MISINFO PATTERNS (healthcare-specific)
-# ----------------------------------------------
-# Each entry: (compiled regex, human-readable description, severity)
-# Severity: "high" = well-established misinformation, "medium" = suspicious rhetoric
-
+# regex patterns for known health misinfo. each is (pattern, description, severity)
+# severity: high = well-documented false claim, medium = suspicious but not definitive
 MISINFO_PATTERNS = [
     # Vaccines
     (r"vaccines?\s+caus(e|es|ed|ing)\s+autism", "Vaccines cause autism", "high"),
-    (r"vaccines?\s+(are|is)\s+(poison|toxic|dangerous)", "Vaccines are toxic/dangerous", "high"),
-    (r"vaccines?\s+(contain|have)\s+microchips?", "Vaccines contain microchips", "high"),
-    (r"vaccines?\s+(alter|change|modify)\s+(your\s+)?dna", "Vaccines alter DNA", "high"),
-    (r"(don.?t|never|stop)\s+vaccinate?\s+(your\s+)?(kids?|children|babies?)", "Anti-vaccination rhetoric", "high"),
-    (r"natural\s+immunity\s+is\s+(all|enough|better|superior)", "Natural immunity superiority claims", "medium"),
-
+    (
+        r"vaccines?\s+(are|is)\s+(poison|toxic|dangerous)",
+        "Vaccines are toxic/dangerous",
+        "high",
+    ),
+    (
+        r"vaccines?\s+(contain|have)\s+microchips?",
+        "Vaccines contain microchips",
+        "high",
+    ),
+    (
+        r"vaccines?\s+(alter|change|modify)\s+(your\s+)?dna",
+        "Vaccines alter DNA",
+        "high",
+    ),
+    (
+        r"(don.?t|never|stop)\s+vaccinate?\s+(your\s+)?(kids?|children|babies?)",
+        "Anti-vaccination rhetoric",
+        "high",
+    ),
+    (
+        r"natural\s+immunity\s+is\s+(all|enough|better|superior)",
+        "Natural immunity superiority claims",
+        "medium",
+    ),
     # COVID-specific
     (r"covid.{0,10}(hoax|fake|planned|plandemic)", "COVID is a hoax/planned", "high"),
-    (r"5g\s+(caus|spread|transmit).{0,20}(covid|virus|disease)", "5G causes COVID", "high"),
+    (
+        r"5g\s+(caus|spread|transmit).{0,20}(covid|virus|disease)",
+        "5G causes COVID",
+        "high",
+    ),
     (r"ivermectin\s+(cure|treat|heal).{0,20}covid", "Ivermectin cures COVID", "high"),
-    (r"hydroxychloroquine\s+(cure|treat|heal).{0,20}covid", "Hydroxychloroquine cures COVID", "high"),
+    (
+        r"hydroxychloroquine\s+(cure|treat|heal).{0,20}covid",
+        "Hydroxychloroquine cures COVID",
+        "high",
+    ),
     (r"masks?\s+(don.?t|do\s+not|never)\s+work", "Masks don't work", "medium"),
-
     # Big Pharma / conspiracy
-    (r"big\s+pharma\s+(is\s+)?(hiding|suppressing|covering)", "Big Pharma suppression conspiracy", "medium"),
-    (r"cure\s+for\s+cancer\s+(is\s+)?(being\s+)?(hidden|suppressed|covered)", "Cancer cure is hidden", "high"),
-    (r"doctors?\s+(are|is)\s+(all\s+)?(lying|paid\s+off|corrupt|bribed)", "Doctors are corrupt/lying", "medium"),
-    (r"(pharma|drug)\s+companies?\s+(don.?t|do\s+not)\s+want\s+you\s+to\s+know", "Pharma hiding information", "medium"),
-    (r"(government|fda|cdc|who)\s+(is\s+)?(lying|corrupt|hiding|cover)", "Government health conspiracy", "medium"),
-
+    (
+        r"big\s+pharma\s+(is\s+)?(hiding|suppressing|covering)",
+        "Big Pharma suppression conspiracy",
+        "medium",
+    ),
+    (
+        r"cure\s+for\s+cancer\s+(is\s+)?(being\s+)?(hidden|suppressed|covered)",
+        "Cancer cure is hidden",
+        "high",
+    ),
+    (
+        r"doctors?\s+(are|is)\s+(all\s+)?(lying|paid\s+off|corrupt|bribed)",
+        "Doctors are corrupt/lying",
+        "medium",
+    ),
+    (
+        r"(pharma|drug)\s+companies?\s+(don.?t|do\s+not)\s+want\s+you\s+to\s+know",
+        "Pharma hiding information",
+        "medium",
+    ),
+    (
+        r"(government|fda|cdc|who)\s+(is\s+)?(lying|corrupt|hiding|cover)",
+        "Government health conspiracy",
+        "medium",
+    ),
     # Alternative medicine overclaims
-    (r"(essential\s+oils?|herbs?|crystals?|homeopathy)\s+(cure|heal|treat).{0,20}(cancer|diabetes|hiv|aids)", "Alt medicine cures serious disease", "high"),
-    (r"(alkaline|detox|cleanse)\s+(cure|heal|prevent).{0,20}(cancer|disease)", "Alkaline/detox cures disease", "high"),
-    (r"(coffee\s+enema|turpentine|bleach|mms)\s+(cure|heal|treat)", "Dangerous substance as medicine", "high"),
-
+    (
+        r"(essential\s+oils?|herbs?|crystals?|homeopathy)\s+(cure|heal|treat).{0,20}(cancer|diabetes|hiv|aids)",
+        "Alt medicine cures serious disease",
+        "high",
+    ),
+    (
+        r"(alkaline|detox|cleanse)\s+(cure|heal|prevent).{0,20}(cancer|disease)",
+        "Alkaline/detox cures disease",
+        "high",
+    ),
+    (
+        r"(coffee\s+enema|turpentine|bleach|mms)\s+(cure|heal|treat)",
+        "Dangerous substance as medicine",
+        "high",
+    ),
     # Anti-science
-    (r"(germ\s+theory|evolution)\s+(is\s+)?(a\s+)?(lie|myth|fraud|hoax|wrong)", "Germ theory denial", "high"),
-    (r"(fluoride|water)\s+(is\s+)?(poison|mind\s+control|toxic)", "Fluoride conspiracy", "medium"),
-    (r"(chemtrails?)\s+(are|is)\s+(spraying|poison|real)", "Chemtrails conspiracy", "medium"),
+    (
+        r"(germ\s+theory|evolution)\s+(is\s+)?(a\s+)?(lie|myth|fraud|hoax|wrong)",
+        "Germ theory denial",
+        "high",
+    ),
+    (
+        r"(fluoride|water)\s+(is\s+)?(poison|mind\s+control|toxic)",
+        "Fluoride conspiracy",
+        "medium",
+    ),
+    (
+        r"(chemtrails?)\s+(are|is)\s+(spraying|poison|real)",
+        "Chemtrails conspiracy",
+        "medium",
+    ),
 ]
 
 # Compile patterns once
-COMPILED_PATTERNS = [(re.compile(p, re.IGNORECASE), desc, sev) for p, desc, sev in MISINFO_PATTERNS]
+COMPILED_PATTERNS = [
+    (re.compile(p, re.IGNORECASE), desc, sev) for p, desc, sev in MISINFO_PATTERNS
+]
 
-# ----------------------------------------------
-# CLAIM CATEGORIES (for zero-shot extraction)
-# ----------------------------------------------
-
+# labels for zero-shot claim classification
 HEALTH_CLAIM_TYPES = [
     "a specific health treatment or cure",
     "a claim about vaccine safety or efficacy",
@@ -120,15 +172,15 @@ HEALTH_CLAIM_TYPES = [
     "general health education or information",
 ]
 
-# ----------------------------------------------
-# DATA CLASSES
-# ----------------------------------------------
+# data classes
+
 
 @dataclass
 class PatternMatch:
     pattern_description: str
     severity: str
     match_count: int
+
 
 @dataclass
 class FactCheckResult:
@@ -138,14 +190,16 @@ class FactCheckResult:
     publisher: str
     url: str
 
+
 @dataclass
 class ClaimAnalysis:
     claim_text: str
     claim_type: str
     claim_type_confidence: float
-    entailment_label: str       # "supported", "refuted", "neutral"
+    entailment_label: str  # "supported", "refuted", "neutral"
     entailment_confidence: float
     fact_checks: list[FactCheckResult] = field(default_factory=list)
+
 
 @dataclass
 class VideoMisinfoReport:
@@ -159,16 +213,13 @@ class VideoMisinfoReport:
     # Claim-level analysis
     claims_analyzed: list[ClaimAnalysis] = field(default_factory=list)
     # Overall assessment
-    risk_level: str = "low"   # low / medium / high
+    risk_level: str = "low"  # low / medium / high
     risk_reasons: list[str] = field(default_factory=list)
 
 
-# ----------------------------------------------
-# TRANSCRIPT HELPERS
-# ----------------------------------------------
-
 def fetch_transcript(video_id: str) -> str | None:
-    """Fetch and clean a video transcript. Returns None if unavailable."""
+    # try english first, fall back to whatever's available
+    # returns None if no transcript at all
     try:
         try:
             transcript = ytt_api.fetch(video_id, languages=["en"])
@@ -177,19 +228,18 @@ def fetch_transcript(video_id: str) -> str | None:
 
         text = " ".join(s.text for s in transcript.snippets)
         # Clean
-        text = re.sub(r'\[[^\]]*\]', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\([^)]*\)', '', text)
-        text = re.sub(r'\b(?:um|uh|ugh|hmm)\b', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\s+', ' ', text).strip()
+        text = re.sub(r"\[[^\]]*\]", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\([^)]*\)", "", text)
+        text = re.sub(r"\b(?:um|uh|ugh|hmm)\b", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip()
         return text
-    except Exception as e:
+    except Exception:
         return None
 
 
 def extract_sentences(text: str) -> list[str]:
-    """Split text into sentence-like chunks for claim analysis."""
-    # Split on sentence-ending punctuation
-    raw = re.split(r'(?<=[.!?])\s+', text)
+    # splits on sentence endings and filters to reasonable lengths (5-60 words)
+    raw = re.split(r"(?<=[.!?])\s+", text)
     sentences = []
     for s in raw:
         s = s.strip()
@@ -200,34 +250,24 @@ def extract_sentences(text: str) -> list[str]:
     return sentences
 
 
-# ----------------------------------------------
-# 1. PATTERN-BASED DETECTION
-# ----------------------------------------------
-
 def scan_patterns(text: str) -> list[PatternMatch]:
-    """Scan text for known misinformation patterns."""
     matches = []
     for pattern, description, severity in COMPILED_PATTERNS:
         found = pattern.findall(text)
         if found:
-            matches.append(PatternMatch(
-                pattern_description=description,
-                severity=severity,
-                match_count=len(found),
-            ))
+            matches.append(
+                PatternMatch(
+                    pattern_description=description,
+                    severity=severity,
+                    match_count=len(found),
+                )
+            )
     return matches
 
 
-# ----------------------------------------------
-# 2. GOOGLE FACT CHECK TOOLS API
-# ----------------------------------------------
-
 def search_fact_checks(query: str, max_results: int = 3) -> list[FactCheckResult]:
-    """
-    Search Google's Fact Check Tools API for existing fact-checks on a claim.
-    Free, no OAuth -- just needs an API key.
-    Docs: https://developers.google.com/fact-check/tools/api/reference/rest
-    """
+    # hits the Google Fact Check Tools API -- free tier, just needs an api key
+    # returns up to max_results ratings from real fact-check publishers
     if not GOOGLE_API_KEY:
         return []
 
@@ -248,34 +288,28 @@ def search_fact_checks(query: str, max_results: int = 3) -> list[FactCheckResult
         results = []
         for claim in data.get("claims", [])[:max_results]:
             for review in claim.get("claimReview", []):
-                results.append(FactCheckResult(
-                    claim_text=claim.get("text", ""),
-                    claimant=claim.get("claimant"),
-                    rating=review.get("textualRating", "Unknown"),
-                    publisher=review.get("publisher", {}).get("name", "Unknown"),
-                    url=review.get("url", ""),
-                ))
+                results.append(
+                    FactCheckResult(
+                        claim_text=claim.get("text", ""),
+                        claimant=claim.get("claimant"),
+                        rating=review.get("textualRating", "Unknown"),
+                        publisher=review.get("publisher", {}).get("name", "Unknown"),
+                        url=review.get("url", ""),
+                    )
+                )
         return results
     except Exception:
         return []
 
 
-# ----------------------------------------------
-# 3. NLI-BASED CLAIM ANALYSIS
-# ----------------------------------------------
-
 def classify_claim_type(sentence: str) -> tuple[str, float]:
-    """Classify what type of health claim a sentence is."""
     result = nli_model(sentence, candidate_labels=HEALTH_CLAIM_TYPES)
     return result["labels"][0], round(result["scores"][0], 4)
 
 
 def check_entailment(claim: str, evidence: str | None = None) -> tuple[str, float]:
-    """
-    Use NLI to check if a claim is supported, refuted, or neutral
-    relative to established medical consensus framing.
-    """
-    # We frame consensus positions as hypotheses and test the claim against them
+    # frames the claim against 3 consensus hypotheses and picks the best match
+    # returns (supported/refuted/neutral, confidence)
     consensus_hypotheses = [
         "This claim is consistent with established medical science.",
         "This claim contradicts established medical science.",
@@ -292,7 +326,7 @@ def check_entailment(claim: str, evidence: str | None = None) -> tuple[str, floa
 
 
 def is_health_claim(sentence: str) -> bool:
-    """Quick filter: is this sentence making a health-related claim (vs. just narration)?"""
+    # quick filter so we don't run the full NLI pipeline on filler text
     result = nli_model(
         sentence,
         candidate_labels=[
@@ -300,20 +334,19 @@ def is_health_claim(sentence: str) -> bool:
             "general narration or filler",
         ],
     )
-    return result["labels"][0] == "a factual health or medical claim" and result["scores"][0] > 0.6
+    return (
+        result["labels"][0] == "a factual health or medical claim"
+        and result["scores"][0] > 0.6
+    )
 
 
 def analyze_claims(text: str, max_claims: int = 10) -> list[ClaimAnalysis]:
-    """
-    Extract sentences that look like health claims, classify them,
-    check entailment, and search for existing fact-checks.
-    """
     sentences = extract_sentences(text)
 
-    # Filter to only health claim sentences (batch for speed)
+    # check more sentences than we need so we have room to filter
     claim_sentences = []
     for s in sentences:
-        if len(claim_sentences) >= max_claims * 3:  # check more than we need, then trim
+        if len(claim_sentences) >= max_claims * 3:
             break
         if is_health_claim(s):
             claim_sentences.append(s)
@@ -324,33 +357,32 @@ def analyze_claims(text: str, max_claims: int = 10) -> list[ClaimAnalysis]:
         entailment, ent_conf = check_entailment(sentence)
 
         # Skip boring "general education" claims that are clearly fine
-        if claim_type == "general health education or information" and entailment == "supported":
+        if (
+            claim_type == "general health education or information"
+            and entailment == "supported"
+        ):
             continue
 
         # Search Google Fact Check API for this claim
         fact_checks = search_fact_checks(sentence)
 
-        analyses.append(ClaimAnalysis(
-            claim_text=sentence,
-            claim_type=claim_type,
-            claim_type_confidence=type_conf,
-            entailment_label=entailment,
-            entailment_confidence=ent_conf,
-            fact_checks=fact_checks,
-        ))
+        analyses.append(
+            ClaimAnalysis(
+                claim_text=sentence,
+                claim_type=claim_type,
+                claim_type_confidence=type_conf,
+                entailment_label=entailment,
+                entailment_confidence=ent_conf,
+                fact_checks=fact_checks,
+            )
+        )
 
     return analyses
 
 
-# ----------------------------------------------
-# FULL PIPELINE
-# ----------------------------------------------
-
 def check_video(video_id: str) -> VideoMisinfoReport:
-    """Full misinformation check pipeline for a single video."""
     report = VideoMisinfoReport(video_id=video_id)
 
-    # 1. Fetch transcript
     text = fetch_transcript(video_id)
     if not text:
         report.error = "Could not fetch transcript"
@@ -358,31 +390,43 @@ def check_video(video_id: str) -> VideoMisinfoReport:
 
     report.transcript_length_words = len(text.split())
 
-    # 2. Pattern-based scan
     report.pattern_matches = scan_patterns(text)
-    report.high_severity_count = sum(1 for m in report.pattern_matches if m.severity == "high")
-    report.medium_severity_count = sum(1 for m in report.pattern_matches if m.severity == "medium")
+    report.high_severity_count = sum(
+        1 for m in report.pattern_matches if m.severity == "high"
+    )
+    report.medium_severity_count = sum(
+        1 for m in report.pattern_matches if m.severity == "medium"
+    )
 
-    # 3. Claim-level analysis (NLI + fact-check API)
     report.claims_analyzed = analyze_claims(text)
 
-    # 4. Compute overall risk level
-    refuted_claims = sum(1 for c in report.claims_analyzed if c.entailment_label == "refuted")
+    # figure out overall risk
+    refuted_claims = sum(
+        1 for c in report.claims_analyzed if c.entailment_label == "refuted"
+    )
     fact_checked_false = sum(
-        1 for c in report.claims_analyzed
+        1
+        for c in report.claims_analyzed
         for fc in c.fact_checks
-        if any(word in fc.rating.lower() for word in ["false", "pants on fire", "incorrect", "misleading", "wrong"])
+        if any(
+            word in fc.rating.lower()
+            for word in ["false", "pants on fire", "incorrect", "misleading", "wrong"]
+        )
     )
 
     reasons = []
     if report.high_severity_count > 0:
         reasons.append(f"{report.high_severity_count} high-severity misinfo pattern(s)")
     if refuted_claims > 0:
-        reasons.append(f"{refuted_claims} claim(s) flagged as contradicting medical consensus")
+        reasons.append(
+            f"{refuted_claims} claim(s) flagged as contradicting medical consensus"
+        )
     if fact_checked_false > 0:
         reasons.append(f"{fact_checked_false} claim(s) rated false by fact-checkers")
     if report.medium_severity_count >= 3:
-        reasons.append(f"{report.medium_severity_count} medium-severity suspicious patterns")
+        reasons.append(
+            f"{report.medium_severity_count} medium-severity suspicious patterns"
+        )
 
     report.risk_reasons = reasons
 
@@ -395,10 +439,6 @@ def check_video(video_id: str) -> VideoMisinfoReport:
 
     return report
 
-
-# ----------------------------------------------
-# VIDEO ID SOURCES
-# ----------------------------------------------
 
 def ids_from_file(filepath: str) -> list[str]:
     path = Path(filepath)
@@ -415,21 +455,22 @@ def ids_from_file(filepath: str) -> list[str]:
 
 def get_supabase_client():
     from supabase import create_client
+
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("Error: SUPABASE_URL / SUPABASE_KEY not set.")
         sys.exit(1)
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# Lazily initialized -- avoids loading a second model unless process_claims_table() is called
+# lazy load so we don't pull in a second model unless process_claims_table() is actually called
 _claim_sentiment_pipeline = None
+
 
 def _get_claim_sentiment_pipeline():
     global _claim_sentiment_pipeline
     if _claim_sentiment_pipeline is None:
-        from transformers import pipeline as hf_pipeline
         print("Loading sentiment model for claims...")
-        _claim_sentiment_pipeline = hf_pipeline(
+        _claim_sentiment_pipeline = hf_pipeline(  # type: ignore[call-overload]
             "sentiment-analysis",
             model="cardiffnlp/twitter-roberta-base-sentiment-latest",
             top_k=None,
@@ -438,11 +479,7 @@ def _get_claim_sentiment_pipeline():
 
 
 def _run_claim_sentiment(claim_text: str) -> tuple[str, float]:
-    """
-    Returns (sentiment_label, sentiment_score).
-    sentiment_label: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL'
-    sentiment_score: float -1.0 to +1.0  (POS_conf - NEG_conf)
-    """
+    # same gradient approach as transcript sentiment: POS - NEG => -1.0 to +1.0
     pipe = _get_claim_sentiment_pipeline()
     result = pipe(claim_text[:512])[0]  # list of 3 dicts
     scores = {r["label"].lower(): r["score"] for r in result}
@@ -457,34 +494,39 @@ def _run_claim_sentiment(claim_text: str) -> tuple[str, float]:
 
 
 def _run_fact_check_status(claim_text: str) -> str:
-    """
-    Returns a fact_check_status string: 'false' | 'misleading' | 'true' | 'unverified'
-    based on the top-rated fact-check result from the Google API.
-    """
+    # returns the verdict from google fact check, or 'pending' if nothing found
+    # Returns: 'pending', 'verified_true', 'verified_false', 'unverifiable'
     results = search_fact_checks(claim_text, max_results=3)
     if not results:
-        return "unverified"
+        return "pending"
 
-    FALSE_WORDS = {"false", "pants on fire", "incorrect", "misleading", "wrong", "inaccurate", "fake"}
+    FALSE_WORDS = {
+        "false",
+        "pants on fire",
+        "incorrect",
+        "misleading",
+        "wrong",
+        "inaccurate",
+        "fake",
+    }
     TRUE_WORDS = {"true", "correct", "accurate", "verified", "mostly true"}
+    UNVERIFIABLE_WORDS = {"unverifiable", "unproven", "unclear", "mixed"}
 
     for fc in results:
         rating = fc.rating.lower()
         if any(w in rating for w in FALSE_WORDS):
-            if "mislead" in rating:
-                return "misleading"
-            return "false"
+            return "verified_false"
         if any(w in rating for w in TRUE_WORDS):
-            return "true"
+            return "verified_true"
+        if any(w in rating for w in UNVERIFIABLE_WORDS):
+            return "unverifiable"
 
-    return "unverified"
+    # If we got results but couldn't categorize them, mark as unverifiable
+    return "unverifiable"
 
 
 def _misinfo_label_from_entailment(claim_text: str) -> str:
-    """
-    Derive a misinfo label for a claim using NLI entailment.
-    Returns: 'misinfo' | 'clean' | 'uncertain'
-    """
+    # uses NLI entailment as a fallback when the fact check api has no results
     entailment, confidence = check_entailment(claim_text)
     if entailment == "refuted" and confidence >= 0.6:
         return "misinfo"
@@ -493,31 +535,41 @@ def _misinfo_label_from_entailment(claim_text: str) -> str:
     return "uncertain"
 
 
-# ----------------------------------------------
-# PROCESS CLAIMS TABLE
-# ----------------------------------------------
+def _calculate_fact_check_confidence(
+    entailment_confidence: float, has_fact_checks: bool
+) -> str:
+    """
+    Calculate fact check confidence level based on NLI confidence and fact check availability.
+    Returns: 'high', 'medium', or 'low'
+    """
+    # High confidence: strong NLI confidence (>= 0.75) AND external fact checks found
+    if entailment_confidence >= 0.75 and has_fact_checks:
+        return "high"
+
+    # Medium confidence: decent NLI confidence (>= 0.5) OR has fact checks
+    if entailment_confidence >= 0.5 or has_fact_checks:
+        return "medium"
+
+    # Low confidence: weak NLI and no external validation
+    return "low"
+
 
 def process_claims_table(batch_size: int = 50):
-    """
-    Pull rows from the 'claims' table where sentiment_label, sentiment_score,
-    or fact_check_status is NULL, then update each row in place.
-
-    Updates per claim:
-      - sentiment_label  (POSITIVE / NEGATIVE / NEUTRAL)
-      - sentiment_score  (-1.0 to +1.0, true gradient)
-      - fact_check_status  (false / misleading / true / unverified)
-      - llm_confidence   (NLI entailment confidence, 0.0-1.0)
-    """
+    # pulls claims rows where any of the key fields are null and fills them in
+    # updates: sentiment_label, sentiment_score, fact_check_status, fact_check_confidence
     client = get_supabase_client()
 
-    # Fetch unprocessed claims (any of the three fields is null)
+    # Fetch unprocessed claims (any of the fields is null)
     resp = (
         client.table("claims")
-        .select("claim_id, claim_text, sentiment_label, sentiment_score, fact_check_status")
+        .select(
+            "claim_id, claim_text, sentiment_label, sentiment_score, fact_check_status, fact_check_confidence"
+        )
         .or_(
             "sentiment_label.is.null,"
             "sentiment_score.is.null,"
-            "fact_check_status.is.null"
+            "fact_check_status.is.null,"
+            "fact_check_confidence.is.null"
         )
         .limit(batch_size)
         .execute()
@@ -552,17 +604,16 @@ def process_claims_table(batch_size: int = 50):
             updates["fact_check_status"] = fc_status
             print(f"    fact_check_status: {fc_status}")
 
-        # --- llm_confidence (NLI entailment) ---
-        # Always compute alongside fact check since we're already running NLI
-        entailment_label, entailment_conf = check_entailment(claim_text)
-        misinfo_label = "misinfo" if entailment_label == "refuted" and entailment_conf >= 0.6 else \
-                        "clean" if entailment_label == "supported" and entailment_conf >= 0.6 else \
-                        "uncertain"
-        updates["llm_confidence"] = entailment_conf
-        # Store misinfo label into fact_check_status if it's still unverified and NLI says misinfo
-        if updates.get("fact_check_status") == "unverified" and misinfo_label == "misinfo":
-            updates["fact_check_status"] = "misinfo"
-        print(f"    llm: {entailment_label} ({entailment_conf:.0%}) -> {misinfo_label}")
+        # --- fact_check_confidence ---
+        # Calculate fact_check_confidence if null (uses entailment for confidence calculation)
+        if row["fact_check_confidence"] is None:
+            entailment_label, entailment_conf = check_entailment(claim_text)
+            fact_checks = search_fact_checks(claim_text, max_results=3)
+            confidence = _calculate_fact_check_confidence(
+                entailment_conf, len(fact_checks) > 0
+            )
+            updates["fact_check_confidence"] = confidence
+            print(f"    fact_check_confidence: {confidence}")
 
         # --- Push update to Supabase ---
         if updates:
@@ -599,41 +650,41 @@ def ids_from_supabase_without_misinfo() -> list[str]:
     done_ids = {r["video_id"] for r in existing.data}
 
     remaining = list(all_ids - done_ids)
-    print(f"  {len(all_ids)} total videos, {len(done_ids)} already checked, {len(remaining)} remaining")
+    print(
+        f"  {len(all_ids)} total videos, {len(done_ids)} already checked, {len(remaining)} remaining"
+    )
     return remaining
 
 
 def push_misinfo_to_supabase(report: VideoMisinfoReport):
-    """
-    Push a misinformation report into the insights table.
-    """
     if report.error:
         return
 
     client = get_supabase_client()
 
-    # Build claims JSON -- each analyzed claim with its verdict
     claims_data = []
     for c in report.claims_analyzed:
-        claims_data.append({
-            "claim_text": c.claim_text,
-            "claim_type": c.claim_type,
-            "claim_type_confidence": c.claim_type_confidence,
-            "entailment_label": c.entailment_label,
-            "entailment_confidence": c.entailment_confidence,
-            "fact_checks": [
-                {
-                    "claim_text": fc.claim_text,
-                    "claimant": fc.claimant,
-                    "rating": fc.rating,
-                    "publisher": fc.publisher,
-                    "url": fc.url,
-                }
-                for fc in c.fact_checks
-            ],
-        })
+        claims_data.append(
+            {
+                "claim_text": c.claim_text,
+                "claim_type": c.claim_type,
+                "claim_type_confidence": c.claim_type_confidence,
+                "entailment_label": c.entailment_label,
+                "entailment_confidence": c.entailment_confidence,
+                "fact_checks": [
+                    {
+                        "claim_text": fc.claim_text,
+                        "claimant": fc.claimant,
+                        "rating": fc.rating,
+                        "publisher": fc.publisher,
+                        "url": fc.url,
+                    }
+                    for fc in c.fact_checks
+                ],
+            }
+        )
 
-    # Build narratives -- pattern matches found
+    # pattern matches found
     narratives_data = [
         {
             "pattern": m.pattern_description,
@@ -643,7 +694,6 @@ def push_misinfo_to_supabase(report: VideoMisinfoReport):
         for m in report.pattern_matches
     ]
 
-    # Labels -- overall risk assessment
     labels_data = {
         "risk_level": report.risk_level,
         "risk_reasons": report.risk_reasons,
@@ -652,7 +702,7 @@ def push_misinfo_to_supabase(report: VideoMisinfoReport):
         "transcript_length_words": report.transcript_length_words,
     }
 
-    # Confidence -- map risk_level to a confidence value
+    # low risk = high confidence the video is clean, high risk = low confidence
     confidence_map = {"low": 0.9, "medium": 0.6, "high": 0.3}
     confidence = confidence_map.get(report.risk_level, 0.5)
 
@@ -665,15 +715,12 @@ def push_misinfo_to_supabase(report: VideoMisinfoReport):
         "confidence": confidence,
     }
 
-    resp = client.table(SUPABASE_TABLE_INSIGHTS).insert(row).execute()
+    client.table(SUPABASE_TABLE_INSIGHTS).insert(row).execute()
     print(f"    [OK] Pushed misinfo report for {report.video_id} to Supabase")
 
 
-# ----------------------------------------------
-# PRETTY PRINTING
-# ----------------------------------------------
-
 RISK_ICONS = {"low": "[LOW]", "medium": "[MED]", "high": "[HIGH]"}
+
 
 def print_report(report: VideoMisinfoReport):
     icon = RISK_ICONS.get(report.risk_level, "[?]")
@@ -682,56 +729,49 @@ def print_report(report: VideoMisinfoReport):
         print(f"  [!] {report.error}\n")
         return
 
-    print(f"  Risk: {icon} {report.risk_level.upper()}  ({report.transcript_length_words} words)")
+    print(
+        f"  Risk: {icon} {report.risk_level.upper()}  ({report.transcript_length_words} words)"
+    )
 
     # Pattern matches
     if report.pattern_matches:
-        print(f"  Pattern flags:")
+        print("  Pattern flags:")
         for m in report.pattern_matches:
             sev_icon = "[HIGH]" if m.severity == "high" else "[MED]"
             print(f"    {sev_icon} {m.pattern_description} (x{m.match_count})")
     else:
-        print(f"  Pattern flags: None")
+        print("  Pattern flags: None")
 
     # Claims
     if report.claims_analyzed:
         print(f"  Claims analyzed: {len(report.claims_analyzed)}")
         for i, c in enumerate(report.claims_analyzed, 1):
-            ent_icon = {"supported": "[OK]", "refuted": "[X]", "neutral": "[-]"}.get(c.entailment_label, "?")
-            print(f"    {i}. {ent_icon} [{c.entailment_label}] ({c.entailment_confidence:.0%}) {c.claim_text[:120]}")
+            ent_icon = {"supported": "[OK]", "refuted": "[X]", "neutral": "[-]"}.get(
+                c.entailment_label, "?"
+            )
+            print(
+                f"    {i}. {ent_icon} [{c.entailment_label}] ({c.entailment_confidence:.0%}) {c.claim_text[:120]}"
+            )
             if c.fact_checks:
                 for fc in c.fact_checks:
-                    print(f"       [FC] {fc.publisher}: \"{fc.rating}\"")
+                    print(f'       [FC] {fc.publisher}: "{fc.rating}"')
                     print(f"            {fc.url}")
     else:
-        print(f"  Claims: No notable health claims detected")
+        print("  Claims: No notable health claims detected")
 
     # Risk reasons
     if report.risk_reasons:
-        print(f"  Reasons:")
+        print("  Reasons:")
         for r in report.risk_reasons:
             print(f"    -> {r}")
 
     print()
 
 
-# ----------------------------------------------
-# CLI
-# ----------------------------------------------
-# Usage:
-#   python misinfo_checker.py                          -> test video
-#   python misinfo_checker.py 1 video_ids.txt          -> from file
-#   python misinfo_checker.py 2                        -> from supabase (all)
-#   python misinfo_checker.py 3                        -> from supabase (only unchecked, auto-push)
-#   python misinfo_checker.py 4                        -> process claims table (fill NULL fields)
-#   python misinfo_checker.py --video <VIDEO_ID>       -> single video by ID
-#   Add --push to any mode to save results to supabase
-#   Add --json to dump full report to misinfo_report.json
-
 if __name__ == "__main__":
     push_to_db = "--push" in sys.argv
 
-    # Mode 4: process claims table directly -- no video pipeline needed
+    # mode 4 is claims-table-only, skip the video pipeline
     if len(sys.argv) > 1 and sys.argv[1] == "4":
         batch = 50
         if "--batch" in sys.argv:
@@ -752,7 +792,7 @@ if __name__ == "__main__":
         mode = sys.argv[1] if len(sys.argv) > 1 else None
 
         if mode is None:
-            video_ids = ["dQw4w9WgXcQ"]
+            video_ids = ["dQw4w9WgXcQ", "T9itjMTqQ8Q"]
         elif mode == "1":
             if len(sys.argv) < 3:
                 print("Usage: python misinfo_checker.py 1 <path_to_ids.txt>")
@@ -764,14 +804,18 @@ if __name__ == "__main__":
             video_ids = ids_from_supabase_without_misinfo()
             push_to_db = True  # auto-push when pulling unchecked from supabase
         else:
-            print(f"Unknown mode '{mode}'. Use: no args | 1 <file> | 2 | 3 | --video <ID>")
+            print(
+                f"Unknown mode '{mode}'. Use: no args | 1 <file> | 2 | 3 | --video <ID>"
+            )
             sys.exit(1)
 
     if not video_ids:
         print("No videos to check.")
         sys.exit(0)
 
-    print(f"Checking {len(video_ids)} video(s) for misinformation...  (push_to_db={push_to_db})\n")
+    print(
+        f"Checking {len(video_ids)} video(s) for misinformation...  (push_to_db={push_to_db})\n"
+    )
 
     all_reports = []
     for i, vid in enumerate(video_ids, 1):
@@ -793,10 +837,14 @@ if __name__ == "__main__":
     total_claims = sum(len(r.claims_analyzed) for r in checked)
 
     print(f"{'=' * 60}")
-    print(f"MISINFORMATION CHECK SUMMARY")
+    print("MISINFORMATION CHECK SUMMARY")
     print(f"{'-' * 60}")
-    print(f"  Videos checked:     {len(checked)}/{len(all_reports)}  (failed: {failed})")
-    print(f"  Risk breakdown:     [HIGH] {high} high  |  [MED] {medium} medium  |  [LOW] {low} low")
+    print(
+        f"  Videos checked:     {len(checked)}/{len(all_reports)}  (failed: {failed})"
+    )
+    print(
+        f"  Risk breakdown:     [HIGH] {high} high  |  [MED] {medium} medium  |  [LOW] {low} low"
+    )
     print(f"  Pattern flags:      {total_patterns} total across all videos")
     print(f"  Claims analyzed:    {total_claims} total")
     if high > 0:

@@ -45,7 +45,11 @@ def fetch_channel_metadata(api_key: str, channel_id: str) -> dict[str, Any]:
     resp.raise_for_status()
     data = resp.json()
     if not data.get("items"):
-        return {"title": "", "handle": "", "url": f"https://www.youtube.com/channel/{channel_id}"}
+        return {
+            "title": "",
+            "handle": "",
+            "url": f"https://www.youtube.com/channel/{channel_id}",
+        }
     sn = data["items"][0].get("snippet", {})
     return {
         "title": sn.get("title", ""),
@@ -103,7 +107,9 @@ def run_pipeline(api_key: str, video_id: str) -> dict[str, Any]:
 
     published_at = snippet.get("publishedAt")
     thumbnails = snippet.get("thumbnails", {}) or {}
-    thumb_url = (thumbnails.get("default") or thumbnails.get("medium") or {}).get("url") or ""
+    thumb_url = (thumbnails.get("default") or thumbnails.get("medium") or {}).get(
+        "url"
+    ) or ""
     view_count = int(statistics.get("viewCount", 0) or 0)
 
     return {

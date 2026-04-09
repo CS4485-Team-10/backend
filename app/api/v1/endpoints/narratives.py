@@ -81,7 +81,9 @@ def list_narratives(
             func.sum(Video.view_count).label("raw_views"),
             func.min(Claim.created_at).label("earliest_claim"),
         )
-        .outerjoin(ClaimNarrative, Narrative.narrative_id == ClaimNarrative.narrative_id)
+        .outerjoin(
+            ClaimNarrative, Narrative.narrative_id == ClaimNarrative.narrative_id
+        )
         .outerjoin(Claim, ClaimNarrative.claim_id == Claim.claim_id)
         .outerjoin(Video, Claim.video_id == Video.video_id)
         .group_by(Narrative.narrative_id)
@@ -117,7 +119,9 @@ def list_narratives(
     rows = session.exec(statement.offset(skip).limit(limit)).all()
 
     data = [
-        _build_narrative_response(narrative, videos_analyzed or 0, raw_views, earliest_claim)
+        _build_narrative_response(
+            narrative, videos_analyzed or 0, raw_views, earliest_claim
+        )
         for narrative, videos_analyzed, raw_views, earliest_claim in rows
     ]
 
@@ -136,7 +140,9 @@ def get_narrative(
             func.sum(Video.view_count).label("raw_views"),
             func.min(Claim.created_at).label("earliest_claim"),
         )
-        .outerjoin(ClaimNarrative, Narrative.narrative_id == ClaimNarrative.narrative_id)
+        .outerjoin(
+            ClaimNarrative, Narrative.narrative_id == ClaimNarrative.narrative_id
+        )
         .outerjoin(Claim, ClaimNarrative.claim_id == Claim.claim_id)
         .outerjoin(Video, Claim.video_id == Video.video_id)
         .where(Narrative.narrative_id == narrative_id)
@@ -149,5 +155,7 @@ def get_narrative(
     narrative, videos_analyzed, raw_views, earliest_claim = row
     return {
         "ok": True,
-        "data": _build_narrative_response(narrative, videos_analyzed or 0, raw_views, earliest_claim),
+        "data": _build_narrative_response(
+            narrative, videos_analyzed or 0, raw_views, earliest_claim
+        ),
     }

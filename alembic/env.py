@@ -13,6 +13,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+
 # region agent log
 def _agent_log_alembic_env(hypothesis_id: str, message: str, data: dict) -> None:
     import json
@@ -20,7 +21,9 @@ def _agent_log_alembic_env(hypothesis_id: str, message: str, data: dict) -> None
     from pathlib import Path
 
     try:
-        log_path = Path(__file__).resolve().parent.parent / ".cursor" / "debug-5c359c.log"
+        log_path = (
+            Path(__file__).resolve().parent.parent / ".cursor" / "debug-5c359c.log"
+        )
         entry = {
             "sessionId": "5c359c",
             "runId": "initial",
