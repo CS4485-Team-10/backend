@@ -175,7 +175,6 @@ HEALTH_CLAIM_TYPES = [
 # data classes
 
 
-
 @dataclass
 class PatternMatch:
     pattern_description: str
@@ -553,7 +552,6 @@ def _calculate_fact_check_confidence(
 
     # Low confidence: weak NLI and no external validation
     return "low"
-
 
 
 def process_claims_table(batch_size: int = 50):
