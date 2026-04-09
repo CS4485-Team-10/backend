@@ -179,14 +179,43 @@ def _chunk_text(text: str, max_chars: int = 12000) -> List[str]:
     return chunks if chunks else [text]
 
 
-_SYSTEM = "You extract factual claims from the transcript. Return ONLY valid JSON."
+_SYSTEM = """You extract GENERALIZABLE HEALTH-RELATED CLAIMS from transcripts.
+
+Your job is to identify only claims that are useful for health insight analysis, misinformation detection, or narrative grouping.
+
+INCLUDE ONLY:
+- Claims about health, disease, symptoms, diagnosis, treatment, prevention, medication, side effects, risk factors, sleep, mental health, biology, or healthcare systems
+- Claims that are generalizable beyond one individual's private life
+- Claims that a reviewer could plausibly verify, fact-check, or group with similar health claims
+- Claims stated as fact, or clearly implied as fact
+
+EXCLUDE:
+- Personal life updates, autobiographical details, or emotional experiences without broader health relevance
+- Motivational, inspirational, spiritual, or self-help statements
+- Vague opinions, feelings, or reflections
+- Social conflict or interpersonal drama unless it directly supports a broader health-related claim
+- Redundant restatements of the same idea
+- Purely historical, geographic, or non-health content
+
+SPECIAL RULE FOR PERSONAL EXPERIENCES:
+If a speaker describes a personal experience, only extract a claim if the statement conveys a broader health-related assertion that could apply beyond that one individual.
+Example:
+- KEEP: "Stimulants can help people with ADHD feel normal and focused."
+- DROP: "The speaker has not seen their mom in a year and a half."
+
+If a transcript contains no generalizable health-related claims, return:
+{"claims": []}
+
+Return ONLY valid JSON.
+"""
+
 _SCHEMA_HINT = """
 {
   "claims": [
     {
-      "text": "string",
+      "text": "A concise, generalizable health-related claim (not a personal anecdote or motivational statement)",
       "confidence": 0.0,
-      "narrative_theme": "optional short theme"
+      "narrative_theme": "A short, reusable health topic label (e.g., Sleep Deprivation Risks, ADHD and Substance Use, Vaccine Skepticism)"
     }
   ]
 }
@@ -194,21 +223,46 @@ _SCHEMA_HINT = """
 
 
 def _build_user_prompt(transcript_chunk: str) -> str:
-    return f"""Extract the main factual claims from the following transcript.
+    return f"""Extract only the GENERALIZABLE HEALTH-RELATED CLAIMS from the transcript below.
 
-Expected JSON output format (return ONLY valid JSON, no other text):
+Return ONLY valid JSON in this format:
 {_SCHEMA_HINT}
+
+Rules:
+- Keep only claims that are health-related and useful beyond one person's private situation
+- Do NOT extract personal anecdotes unless they express a broader health claim
+- Do NOT extract motivational, spiritual, or vague self-help statements
+- Do NOT extract duplicate or near-duplicate claims
+- Prefer concise, normalized wording over dramatic or conversational phrasing
+
+Rules for generating "narrative_theme":
+- Use a short topic label, not a sentence
+- Make it reusable across multiple similar claims
+- Focus on the underlying health topic, not the speaker, tone, or sequence
+- Avoid generic labels like "Personal History", "Initial Effects", "Long-term Effects", "Encouragement"
+- Avoid overly narrow labels that only fit one claim
+- Good examples:
+  - Sleep Deprivation Risks
+  - ADHD and Substance Use
+  - Vaccine Skepticism
+  - Graves Disease Causes and Triggers
+  - Teen Sleep and School Start Times
+  - Mental Health Overprescription
+- Bad examples:
+  - My Journey
+  - Initial Effects
+  - Important Truth
+  - Encouragement
+  - Healing
+
+If there are no valid generalizable health-related claims, return:
+{{"claims": []}}
 
 Transcript:
 ---
 {transcript_chunk}
 ---
-
-Return a single JSON object with a "claims" array. Each claim must have:
-- "text": the factual claim (string)
-- "confidence": how confident you are in this claim (0.0 to 1.0)
-- "narrative_theme": a short phrase describing the overarching narrative this claim belongs to (optional but preferred)"""
-
+"""
 
 def _validate_json_output(text: str) -> Dict[str, Any]:
     """Parse and validate the LLM JSON output."""

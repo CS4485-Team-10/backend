@@ -226,18 +226,37 @@ def _clean_transcript(transcript_data: Union[List[Dict], str]) -> str:
     return text
 
 
-_SEMANTIC_FILTER_SYSTEM = """You classify YouTube video titles for relevance to PUBLIC HEALTH as a domain.
+_SEMANTIC_FILTER_SYSTEM = """You classify YouTube videos for relevance to PUBLIC HEALTH.
 
-PUBLIC HEALTH means: population-level health, disease outbreaks, vaccination, epidemiology, nutrition as a population issue, maternal health, environmental health, mental health at community/population level, health policy, public health education, misinformation around treatments/prevention/disease/population health.
+PUBLIC HEALTH includes:
+- Population-level health topics (disease, prevention, epidemiology)
+- Medical or biological explanations of health conditions
+- Evidence-based health advice or risk factors
+- Mental health topics IF they are educational or generalizable
+- Healthcare systems, policy, access, or funding
+- Health misinformation or claims about treatments
 
-EXCLUDE (filter out):
-- Athlete injury gossip, sports health updates
-- Celebrity illness news unless clearly tied to broader public health discussion
-- Vague religious/spiritual healing unless directly framed as public-health-relevant
-- Random wellness clickbait not actually relevant to public health topics
+STRICTLY EXCLUDE:
+- Personal life stories or anecdotes (even if health-related)
+- Emotional experiences without generalizable insight
+- Motivational or self-help content
+- Individual-specific situations (e.g., “my experience with…”, “the speaker…”)
+- Vague wellness claims without clear mechanism or evidence
+- Non-health content (e.g., hobbies, possessions, general life updates)
 
-Return ONLY valid JSON. For each video, output: {"video_id": "...", "is_relevant": true|false, "reason": "short string", "confidence": 0.0-1.0}"""
+IMPORTANT:
+A video is ONLY relevant if the content is GENERALIZABLE and provides information useful beyond a single individual.
 
+Return ONLY valid JSON in this format:
+[
+  {
+    "video_id": "...",
+    "is_relevant": true | false,
+    "reason": "short explanation",
+    "confidence": 0.0-1.0
+  }
+]
+"""
 
 def _get_llm_provider_for_filtering() -> LLMProvider:
     """Create LLM provider for semantic filtering from YT_SEMANTIC_FILTER_MODEL (default gemma2)."""
@@ -682,7 +701,6 @@ def run_youtube_data_ingestion_pipeline(
         "quota_budget": budget.budget,
         "quota_breached": budget.breached,
     }
-
 
 if __name__ == "__main__":
     run_youtube_data_ingestion_pipeline()
