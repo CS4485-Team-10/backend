@@ -13,10 +13,6 @@ class Claim(SQLModel, table=True):
     video_id: str = Field(foreign_key="videos.video_id")
     transcript_id: uuid.UUID = Field(foreign_key="transcripts.transcript_id")
     claim_text: str = Field(sa_column=Column(Text, nullable=False))
-    supporting_excerpt: Optional[str] = Field(default=None, sa_column=Column(Text))
-    start_time_seconds: Optional[int] = None
-    
-    end_time_seconds: Optional[int] = None
     sentiment_label: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )

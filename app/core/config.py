@@ -1,7 +1,7 @@
 from urllib.parse import quote, urlparse, urlunparse
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def _encode_password_in_url(url: str) -> str:
@@ -24,6 +24,8 @@ def _encode_password_in_url(url: str) -> str:
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
     ENV: str = "dev"
     PORT: int = 8000
     FRONTEND_URL: str = "http://localhost:3000"
@@ -48,9 +50,6 @@ class Settings(BaseSettings):
     @classmethod
     def encode_database_url_password(cls, v: str) -> str:
         return _encode_password_in_url(v)
-
-    class Config:
-        env_file = ".env"
 
 
 settings = Settings()
