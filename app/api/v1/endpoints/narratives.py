@@ -24,6 +24,15 @@ def _format_views(total: Optional[int]) -> str:
     return str(total)
 
 
+def _risk_level_label(score: float) -> str:
+    """Map 0–10 score to API risk_level string (High / Medium / Low)."""
+    if score >= 7.0:
+        return "High"
+    if score >= 4.0:
+        return "Medium"
+    return "Low"
+
+
 def _time_window(earliest: Optional[datetime]) -> str:
     if earliest is None:
         return "No data"
@@ -45,18 +54,15 @@ def _build_narrative_response(
     raw_views: Optional[int],
     earliest_claim: Optional[datetime],
 ) -> NarrativeResponse:
+    score = float(narrative.narrative_risk_score)
     return NarrativeResponse(
         id=str(narrative.narrative_id),
         title=narrative.narrative_label,
         description=narrative.narrative_description,
-        # TODO: separate detail field once narratives.narrative_detail column exists
-        detail=narrative.narrative_description,
-        # TODO: populate once narratives.category column exists
-        category="Uncategorized",
-        # TODO: compute from risk scoring once narratives.risk_level exists
-        risk_level="Medium",
-        # TODO: compute from risk scoring once narratives.risk_score exists
-        risk_score=5.0,
+        detail=narrative.narrative_details or narrative.narrative_description,
+        category=narrative.narrative_category,
+        risk_level=_risk_level_label(score),
+        risk_score=score,
         videos_analyzed=videos_analyzed,
         total_views=_format_views(raw_views),
         time_window=_time_window(earliest_claim),
@@ -94,14 +100,15 @@ def list_narratives(
         statement = statement.where(
             col(Narrative.narrative_label).ilike(pattern)
             | col(Narrative.narrative_description).ilike(pattern)
+            | col(Narrative.narrative_details).ilike(pattern)
+            | col(Narrative.narrative_category).ilike(pattern)
         )
 
     # Sorting
     if sort_by == "views":
         statement = statement.order_by(func.sum(Video.view_count).desc().nulls_last())
     elif sort_by == "risk":
-        # TODO: sort by real risk_score once column exists; for now newest first
-        statement = statement.order_by(Narrative.created_at.desc())
+        statement = statement.order_by(Narrative.narrative_risk_score.desc())
     else:
         # trending = newest first
         statement = statement.order_by(Narrative.created_at.desc())
@@ -113,6 +120,8 @@ def list_narratives(
         count_stmt = count_stmt.where(
             col(Narrative.narrative_label).ilike(pattern)
             | col(Narrative.narrative_description).ilike(pattern)
+            | col(Narrative.narrative_details).ilike(pattern)
+            | col(Narrative.narrative_category).ilike(pattern)
         )
     total = session.exec(count_stmt).one()
 

@@ -1,87 +1,163 @@
 # YouTube Intelligence Platform — Backend
+
+Backend services and pipelines for ingesting YouTube content, extracting health-related claims, matching them into narratives, and serving data via a FastAPI API.
+
+## Overview
+
+This repository contains:
+
+- **FastAPI service** under `app/` with versioned REST endpoints (`/api/v1/...`).
+- **Database models + migrations** (SQLModel/SQLAlchemy + Alembic) for the core analytics schema.
+- **Pipelines** for:
+  - ingesting YouTube metadata + transcripts into Supabase
+  - extracting claims via an LLM provider (local Ollama by default)
+  - matching claims to narratives using embeddings (Google Gemini `embedContent`)
+- **Scripts** in `scripts/` for running pipeline utilities locally.
+
+## Tech Stack
+
+- **API**: FastAPI + Uvicorn
+- **DB/ORM & Migrations**: Supabase, SQLAlchemy 2.x, SQLModel, Alembic (`alembic/`)
+- **YouTube Data Ingestion**: YouTube Data API v3 + `youtube-transcript-api`
+- **LLM inference**: Ollama (OpenAI-compatible endpoint) with optional provider abstraction
+- **Embeddings**: Google Gemini `embedContent` (remote HTTP)
+- **Tooling**: Ruff (format + lint), `python-dotenv`
+
 ## Setup
 
+### Python environment (venv)
+
+From `backend/`:
+
 ```bash
-uv venv .venv
+python -m venv .venv
 source .venv/bin/activate
-uv pip install -r requirements.txt
-cp .env.example .env  # fill in your Supabase credentials
+pip install -r requirements.txt
 ```
 
-## Development Setup
+Optional dev tooling (Ruff + hooks):
 
 ```bash
-# Install dev dependencies and configure git hooks
+pip install -r requirements-dev.txt
 bash scripts/setup-hooks.sh
 ```
 
-Or manually:
+### Ruff (format + lint)
 
 ```bash
-# Install dev dependencies
-uv pip install -r requirements-dev.txt  # or: pip install -r requirements-dev.txt
-
-# Configure git hooks
-git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit
+ruff format .
+ruff check .
 ```
 
-The pre-commit hook runs **ruff format** (formatting) and **ruff check** (linting) on staged Python files.
+If you ran `scripts/setup-hooks.sh`, Ruff also runs automatically on staged files via the pre-commit hook.
 
-## Database Migrations (Alembic)
+### Environment variables (`.env`)
 
-Migrations live in `alembic/versions/`. The database URL is read from `DATABASE_URL` in `.env`.
+Create a local `.env` (do not commit). This repo loads it via Pydantic settings and `python-dotenv`.
+
+- **Required (local dev)**
+  - `DATABASE_URL`
+  - `SUPABASE_URL`
+  - `SUPABASE_SERVICE_ROLE_KEY`
+  - `YOUTUBE_DATA_API_KEY` (or `YOUTUBE_API_KEY`)
+- **Required (narrative matching / embeddings)**
+  - `NARR_EMBEDDING_BACKEND=remote`
+  - `NARR_EMBEDDING_URL` (Gemini `...:embedContent`)
+  - `NARR_EMBEDDING_API_KEY`
+- **Common optional**
+  - `FRONTEND_URL`, `PORT`, `ENV`
+  - `LLM_PROVIDER` (default `ollama`), `LLM_MODEL`, `OLLAMA_BASE_URL`
+  - `YT_SEMANTIC_FILTER_MODEL`, `YT_QUOTA_DAILY_BUDGET_UNITS`
+  - `NARR_EMBEDDING_TIMEOUT`, `NARR_STRONG_MATCH`, `NARR_MULTI_LINK`, `NARR_NEW_MIN`, `NARR_MAX_PER_CLAIM`
+
+Google Console:
+
+- **YouTube**: enable *YouTube Data API v3* → create API key → set `YOUTUBE_DATA_API_KEY`
+- **Gemini**: create Gemini/Google AI API key → set `NARR_EMBEDDING_API_KEY` (+ `NARR_EMBEDDING_URL`)
+
+### Database migrations (Alembic)
+
+Migrations live in `alembic/versions/`. Alembic reads the DB URL from `DATABASE_URL` (wired in `alembic/env.py`; `alembic.ini` is intentionally URL-less).
 
 ```bash
-# Apply all pending migrations
-uv run alembic upgrade head
-
-# Generate a new migration after changing models in app/models/
-uv run alembic revision --autogenerate -m "describe your change"
-
-# Check current migration version
-uv run alembic current
-
-# Rollback the last migration
-uv run alembic downgrade -1
+alembic upgrade head
+alembic current
+alembic revision --autogenerate -m "describe your change"
 ```
 
-## Run the server
+## Running
+
+### Run the API server
 
 ```bash
-uv run uvicorn app.main:app --reload
+uvicorn app.main:app --reload
 ```
 
-## Data Ingestion Pipeline
+Health check:
 
-### Setup
-1. Go to Google Console >> Get an API key for YouTube Data API
-2. Initialize a `.env` file with `YOUTUBE_DATA_API_KEY` set up. 
-3. Create a designated virtual env (either via Python natively or Anaconda) and activate it. 
-4. Install the following packages/libraries using the following command:
-    ```bash
-    pip install google-api-python-client youtube-transcript-api python-dotenv
-    ```
-5. Run the notebook (`yt-data-ingestion.ipynb`) to see the full pipeline in action.
+- `GET /api/v1/health`
 
-### LLM Insight Generation (Claims Extraction)
+### Run pipelines locally
 
-The `llm_insight_generation.ipynb` notebook extracts claims from cleaned transcripts using Ollama.
+#### Ingest a single video (API route)
 
-### Ollama Setup
+- `POST /api/v1/ingest/video` with JSON `{ "video_id": "<id>" }`
+  - Uses `app/pipelines/yt_ingest.py` to fetch video/channel/transcript and upserts to Supabase tables (`channels`, `videos`, `transcripts`).
 
-1. **Install Ollama**: Download from [ollama.com](https://ollama.com) or run `brew install ollama` (macOS).
-2. **Start Ollama**: Open the Ollama app (macOS) or run `ollama serve` in a terminal.
-3. **Pull a model** (required before running the notebook):
-   ```bash
-   ollama pull llama3
-   ```
-   Or use another model (e.g. `llama3.2`, `mistral`).
-4. **Optional – use a different model**: Add `LLM_MODEL=llama3.2` to your `.env` (or export it). Default is `llama3`.
+#### Batch ingest + filter (script entrypoint)
 
-### Running the Claims Pipeline
+```bash
+python -m pipelines.yt_data_ingestion
+```
 
-1. Ensure Ollama is running and at least one model is pulled (`ollama list`).
-2. Install dependencies: `pip install -r requirements.txt`
-3. Run all cells in `pipelines/llm_insight_generation.ipynb` from the top.
-4. The test cell extracts claims from `data/transcripts/cleaned/gpzDxm7qflY.txt`.
+This pipeline searches YouTube, applies an LLM semantic filter (public-health relevance), filters by impact metrics, and persists `videos` + `transcripts` to Supabase.
+
+#### LLM insight generation (claims + narratives)
+
+```bash
+python -m pipelines.llm_insight_generation
+```
+
+This reads Supabase transcripts that don’t yet have claims, extracts generalizable health-related claims, matches them to existing narratives via embeddings (Gemini), creates new narratives when needed, and writes back to Supabase (`claims`, `narratives`, `claim_narratives`).
+
+## Architecture
+
+### `app/` (FastAPI application)
+
+- `**app/main.py**`: FastAPI app, CORS, router mounting at `/api/v1`
+- `**app/api/**`: versioned API routes
+  - `app/api/v1/endpoints/`: endpoints such as `health`, `overview`, `claims`, `narratives`, `ingest`, etc.
+- `**app/core/**`: application config and infrastructure
+  - `app/core/config.py`: Pydantic settings; loads `.env`
+  - `app/core/database.py`: DB session wiring (used by API endpoints)
+- `**app/models/**`: SQLModel models representing DB tables (videos, claims, narratives, join tables, etc.)
+- `**app/schemas/**`: Pydantic response/request schemas for API responses
+- `**app/pipelines/**`: API-facing pipeline helpers (e.g. `yt_ingest.py` used by `/ingest/video`)
+
+### `pipelines/` (batch + ML/LLM pipelines)
+
+Standalone pipeline modules (typically run via `python -m ...`):
+
+- `**pipelines/yt_data_ingestion.py**`: YouTube search + semantic filter + impact filter + persist to Supabase
+- `**pipelines/llm_insight_generation.py**`: claim extraction + narrative creation/linking + persist to Supabase
+- `**pipelines/narrative_matching.py**`: embedding + cosine similarity matching logic (Gemini `embedContent`)
+- `**pipelines/shared/**`: shared pipeline utilities / interfaces
+
+### `alembic/` (migrations)
+
+- `**alembic/env.py**`: migration runtime config (loads `DATABASE_URL`)
+- `**alembic/versions/**`: migration revisions
+
+### `scripts/` (developer utilities)
+
+Convenience scripts for running parts of the pipeline locally:
+
+- `scripts/run_pipeline.py`: runs selected pipeline scripts
+- `scripts/setup-hooks.sh`: installs dev deps + enables git hooks
+- Other one-off analysis scripts (`sentiment_analysis.py`, `misinfo_checker.py`, etc.)
+
+## Deployment notes
+
+- `render.yaml` contains a basic Render configuration for running the FastAPI service.
+- Ensure all required secrets are configured as environment variables in the deployment environment (do not rely on a checked-in `.env`).
+

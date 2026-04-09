@@ -1,70 +1,244 @@
 """
 LLM Insight Generation Pipeline.
 
-Takes transcripts from the ingestion pipeline and passes them into an LLM
-to extract claims, narratives, and trends.
+Reads transcripts from Supabase (only those without existing claims),
+extracts claims via an LLM, semantically matches or creates narratives,
+and persists claims, narratives, and claim_narratives back to Supabase.
+
+**First-pass ownership:** this module normalizes LLM JSON, writes ``claim_text`` and
+``llm_confidence``, and inserts *new* narrative rows from extraction metadata when
+no semantic match exists. Sentiment, fact-check, and risk enrichment are owned by
+other pipelines and are not applied here.
+Narrative embeddings are only used for semantic matching/dedup against
+existing narrative rows, not for LLM extraction. Production defaults to
+``NARR_EMBEDDING_BACKEND=remote`` (Google Gemini ``embedContent``): set
+``NARR_EMBEDDING_URL`` to the full ``.../models/<id>:embedContent`` URL,
+``NARR_EMBEDDING_API_KEY`` (Google AI key, ``x-goog-api-key``), and optionally
+``NARR_EMBEDDING_MODEL``, ``NARR_EMBEDDING_TIMEOUT`` (see
+``pipelines.narrative_matching``).
+
+Re-runs are safe: prior claims and bridge rows for a transcript are
+deleted before new ones are inserted (replace semantics for CRON jobs).
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional
 
 import requests
+from dotenv import load_dotenv
+from supabase import create_client
 
-from pipelines.shared import GeneratedInsights, LLMProvider, TranscriptRecord
-
-# ---------------------------------------------------------------------------
-# Path resolution
-# ---------------------------------------------------------------------------
-
-DATA_ROOT = (
-    Path.cwd().parent / "data"
-    if Path.cwd().name == "pipelines"
-    else Path.cwd() / "data"
+from pipelines.narrative_matching import (
+    MatchDecision,
+    NarrativeCandidate,
+    build_candidate_pool,
+    get_embedder_from_env,
+    match_claim_to_narratives,
+    refresh_pool_with_new,
 )
+from pipelines.shared import LLMProvider
 
-
-def _resolve_cleaned_dir() -> Path:
-    """Resolve path to data/transcripts/cleaned relative to backend root."""
-    return DATA_ROOT / "transcripts" / "cleaned"
-
-
-def _resolve_raw_json_dir() -> Path:
-    """Resolve path to data/transcripts/raw relative to backend root."""
-    return DATA_ROOT / "transcripts" / "raw"
-
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 1. Load & Build Transcripts (private helpers)
+# Environment bootstrap
 # ---------------------------------------------------------------------------
 
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-def _load_cleaned_transcript(fp: Union[str, Path]) -> str:
-    """Load a single cleaned transcript file and return its text content."""
-    file_path = Path(fp)
-    if not file_path.exists():
-        raise FileNotFoundError(f"Transcript file not found: {file_path}")
-    if file_path.suffix != ".txt":
-        raise ValueError(f"File is not formatted as a .txt file: {file_path}")
-    return file_path.read_text(encoding="utf-8")
+SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+
+_PAGE_SIZE = 1000
+
+# Defensive max lengths for parsed LLM fields (downstream of JSON only; prompts unchanged).
+_MAX_CLAIM_TEXT_CHARS = 100_000
+_MAX_NARRATIVE_THEME_CHARS = 500
+_MAX_NARRATIVE_CATEGORY_CHARS = 200
+_MAX_NARRATIVE_DESCRIPTION_CHARS = 4_000
+_MAX_NARRATIVE_DETAILS_CHARS = 8_000
+
+_DEFAULT_NARRATIVE_CATEGORY = "Uncategorized"
 
 
-def _transcript_record_from_path(fp: Union[str, Path]) -> TranscriptRecord:
-    """Build a TranscriptRecord from a single cleaned transcript file path."""
-    path = Path(fp).resolve()
-    video_id = path.stem
-    return TranscriptRecord(
-        video_id=video_id,
-        cleaned_txt_path=path,
-        raw_json_path=None,
+def _clip_str(value: str, max_len: int) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[:max_len]
+
+
+def _normalize_optional_str(raw: Any, max_len: int) -> Optional[str]:
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    return _clip_str(s, max_len)
+
+
+def _normalize_confidence(raw: Any) -> Optional[float]:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+def _normalize_parsed_claim(raw: Any) -> Optional[Dict[str, Any]]:
+    """Return a canonical claim dict, or None if the entry is unusable."""
+    if not isinstance(raw, dict):
+        log.debug("Skipping non-dict claim entry: %s", type(raw).__name__)
+        return None
+
+    text_raw = raw.get("text")
+    if text_raw is None:
+        text_raw = ""
+    elif not isinstance(text_raw, str):
+        text_raw = str(text_raw)
+    text = _clip_str(text_raw.strip(), _MAX_CLAIM_TEXT_CHARS)
+    if not text:
+        return None
+
+    category = _normalize_optional_str(
+        raw.get("narrative_category"), _MAX_NARRATIVE_CATEGORY_CHARS
     )
+    if not category:
+        category = _DEFAULT_NARRATIVE_CATEGORY
+
+    return {
+        "text": text,
+        "confidence": _normalize_confidence(raw.get("confidence")),
+        "narrative_theme": _normalize_optional_str(
+            raw.get("narrative_theme"), _MAX_NARRATIVE_THEME_CHARS
+        ),
+        "narrative_category": category,
+        "narrative_description": _normalize_optional_str(
+            raw.get("narrative_description"), _MAX_NARRATIVE_DESCRIPTION_CHARS
+        ),
+        "narrative_details": _normalize_optional_str(
+            raw.get("narrative_details"), _MAX_NARRATIVE_DETAILS_CHARS
+        ),
+    }
+
+
+def _get_supabase():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ---------------------------------------------------------------------------
-# 2. Prepare for Analysis (private helpers)
+# 1. Supabase reads
+# ---------------------------------------------------------------------------
+
+
+def _fetch_transcripts_without_claims(sb) -> List[Dict[str, Any]]:
+    """Return transcripts rows that have no corresponding claims yet.
+
+    Uses Supabase PostgREST: fetch all transcripts, then subtract those
+    whose transcript_id already appears in claims (set difference in Python
+    since PostgREST has limited subquery support).
+    """
+    all_transcripts: List[Dict[str, Any]] = []
+    offset = 0
+    while True:
+        page = (
+            sb.table("transcripts")
+            .select("video_id, transcript_id, cleaned_transcript_txt")
+            .range(offset, offset + _PAGE_SIZE - 1)
+            .execute()
+        )
+        all_transcripts.extend(page.data)
+        if len(page.data) < _PAGE_SIZE:
+            break
+        offset += _PAGE_SIZE
+
+    if not all_transcripts:
+        return []
+
+    claimed_ids: set[str] = set()
+    offset = 0
+    while True:
+        page = (
+            sb.table("claims")
+            .select("transcript_id")
+            .range(offset, offset + _PAGE_SIZE - 1)
+            .execute()
+        )
+        for row in page.data:
+            claimed_ids.add(str(row["transcript_id"]))
+        if len(page.data) < _PAGE_SIZE:
+            break
+        offset += _PAGE_SIZE
+
+    return [t for t in all_transcripts if str(t["transcript_id"]) not in claimed_ids]
+
+
+def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
+    """Paginated fetch of all rows from the narratives table."""
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+    while True:
+        page = (
+            sb.table("narratives")
+            .select(
+                "narrative_id, narrative_label, narrative_risk_score, "
+                "narrative_category, narrative_description, narrative_details"
+            )
+            .range(offset, offset + _PAGE_SIZE - 1)
+            .execute()
+        )
+        rows.extend(page.data)
+        if len(page.data) < _PAGE_SIZE:
+            break
+        offset += _PAGE_SIZE
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# 2. Replace-semantics: delete old insights for a transcript
+# ---------------------------------------------------------------------------
+
+
+def _delete_existing_insights(sb, transcript_id: str) -> None:
+    """Remove claim_narratives and claims for *transcript_id* (FK-safe order)."""
+    existing_claims = (
+        sb.table("claims")
+        .select("claim_id")
+        .eq("transcript_id", transcript_id)
+        .execute()
+    )
+    claim_ids = [r["claim_id"] for r in existing_claims.data]
+    if not claim_ids:
+        return
+
+    for cid in claim_ids:
+        sb.table("claim_narratives").delete().eq("claim_id", cid).execute()
+    sb.table("claims").delete().eq("transcript_id", transcript_id).execute()
+
+
+# ---------------------------------------------------------------------------
+# 3. Chunking & LLM extraction
 # ---------------------------------------------------------------------------
 
 
@@ -90,8 +264,117 @@ def _chunk_text(text: str, max_chars: int = 12000) -> List[str]:
     return chunks if chunks else [text]
 
 
+_SYSTEM = """You extract GENERALIZABLE HEALTH-RELATED CLAIMS from video transcripts.
+
+Your job is to identify only claims that are useful for health insight analysis, misinformation detection, or narrative grouping.
+For each valid claim, also generate reusable narrative metadata:
+`narrative_theme`, `narrative_category`, `narrative_description`, and `narrative_details`.
+
+INCLUDE ONLY:
+- Claims about health, disease, symptoms, diagnosis, treatment, prevention, medication, side effects, risk factors, sleep, mental health, biology, or healthcare systems
+- Claims that are generalizable beyond one individual's private life
+- Claims that a reviewer could plausibly verify, fact-check, or group with similar health claims
+- Claims stated as fact, or clearly implied as fact
+
+EXCLUDE:
+- Personal life updates, autobiographical details, or emotional experiences without broader health relevance
+- Motivational, inspirational, spiritual, or self-help statements
+- Vague opinions, feelings, or reflections
+- Social conflict or interpersonal drama unless it directly supports a broader health-related claim
+- Redundant restatements of the same idea
+- Purely historical, geographic, or non-health content
+
+SPECIAL RULE FOR PERSONAL EXPERIENCES:
+If a speaker describes a personal experience, only extract a claim if the statement conveys a broader health-related assertion that could apply beyond that one individual.
+Example:
+- KEEP: "Stimulants can help people with ADHD feel normal and focused."
+- DROP: "The speaker has not seen their mom in a year and a half."
+
+If a transcript contains no generalizable health-related claims, return:
+{"claims": []}
+
+Return ONLY valid JSON.
+"""
+
+_SCHEMA_HINT = """
+{
+  "claims": [
+    {
+      "text": "A concise, generalizable health-related claim (not a personal anecdote or motivational statement)",
+      "confidence": 0.0,
+      "narrative_theme": "A short, reusable health topic label (e.g., Sleep Deprivation Risks, ADHD and Substance Use, Vaccine Skepticism)",
+      "narrative_category": "A coarse health category (e.g., Sleep, Mental Health, Vaccines, Chronic Disease, Healthcare Systems)",
+      "narrative_description": "A concise 1-2 sentence summary of the overarching health narrative",
+      "narrative_details": "A slightly richer explanation describing the kinds of claims, mechanisms, risks, or themes that belong under this narrative"
+    }
+  ]
+}
+
+Confidence properties:
+- "confidence" must be a float between 0.0 and 1.0
+- 1.0 = very confident this is a clear, valid, well-formed claim
+- 0.0 = very low confidence or ambiguous claim
+
+""".strip()
+
+
+def _build_user_prompt(transcript_chunk: str) -> str:
+    return f"""Extract only the GENERALIZABLE HEALTH-RELATED CLAIMS from the transcript below.
+
+Return ONLY valid JSON in this format:
+{_SCHEMA_HINT}
+
+Rules:
+- Keep only claims that are health-related and useful beyond one person's private situation
+- Do NOT extract personal anecdotes unless they express a broader health claim
+- Do NOT extract motivational, spiritual, or vague self-help statements
+- Do NOT extract duplicate or near-duplicate claims
+- Prefer concise, normalized wording over dramatic or conversational phrasing
+
+Rules for generating narrative metadata:
+- "narrative_theme" must be a short topic label, not a sentence
+- Make "narrative_theme" reusable across multiple similar claims
+- Focus on the underlying health topic, not the speaker, tone, or sequence
+- Avoid generic labels like "Personal History", "Initial Effects", "Long-term Effects", "Encouragement"
+- Avoid overly narrow labels that only fit one claim
+
+- "narrative_category" must be a coarse reusable health bucket such as:
+  Sleep, Mental Health, Vaccines, Chronic Disease, Healthcare Systems, Nutrition, Medications, Public Health, Addiction, Endocrine Health
+- Use "Uncategorized" only if no reasonable category fits
+
+- "narrative_description" should be a concise 1-2 sentence summary of the broader health narrative
+- "narrative_details" should be a slightly richer explanation of the types of claims, mechanisms, risks, or health ideas that belong under that narrative
+- Do not make description/details speaker-specific
+- Do not make description/details motivational or vague
+- Keep both description and details generalizable and health-relevant
+
+Good examples of narrative_theme:
+- Sleep Deprivation Risks
+- ADHD and Substance Use
+- Vaccine Skepticism
+- Graves Disease Causes and Triggers
+- Teen Sleep and School Start Times
+- Mental Health Overprescription
+
+Bad examples of narrative_theme:
+- My Journey
+- Initial Effects
+- Important Truth
+- Encouragement
+- Healing
+
+If there are no valid generalizable health-related claims, return:
+{{"claims": []}}
+
+Transcript:
+---
+{transcript_chunk}
+---
+"""
+
+
 def _validate_json_output(text: str) -> Dict[str, Any]:
-    """Parse and sanity-check the model output as JSON. Requires 'claims' key."""
+    """Parse and validate the LLM JSON output."""
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
@@ -99,65 +382,39 @@ def _validate_json_output(text: str) -> Dict[str, Any]:
 
     if not isinstance(parsed, dict):
         raise ValueError("Model output must be a JSON object (dict)")
-
     if "claims" not in parsed:
         raise ValueError("Model output must contain a 'claims' key")
-
     if not isinstance(parsed["claims"], list):
         raise ValueError("'claims' must be a list")
-
     return parsed
 
 
-# ---------------------------------------------------------------------------
-# 3. Output structure
-# ---------------------------------------------------------------------------
-
-_SYSTEM = "You extract factual claims from the transcript. Return ONLY valid JSON."
-_SCHEMA_HINT = """
-{
-  "claims": [{"text": "string", "confidence": 0.0}]
-}
-""".strip()
-
-
-def _build_user_prompt(transcript_chunk: str) -> str:
-    """Build the user prompt for the LLM, including the expected JSON shape."""
-    return f"""Extract the main factual claims from the following transcript.
-
-Expected JSON output format (return ONLY valid JSON, no other text):
-{_SCHEMA_HINT}
-
-Transcript:
----
-{transcript_chunk}
----
-
-Return your response as a single JSON object with a "claims" array. Each claim should have "text" (the claim) and "confidence" (0.0 to 1.0)."""
-
-
-def _extract_insights_for_record(
-    record: TranscriptRecord,
+def _extract_claims(
+    transcript_text: str,
     provider: LLMProvider,
     *,
     max_chars: int = 12000,
     retries: int = 2,
-) -> GeneratedInsights:
-    """Load transcript, chunk it, run provider on each chunk, merge and return GeneratedInsights."""
-    text = _load_cleaned_transcript(record.cleaned_txt_path)
-    chunks = _chunk_text(text, max_chars=max_chars)
-    all_claims: List[Dict[str, Any]] = []
+) -> List[Dict[str, Any]]:
+    """Chunk transcript, call LLM per chunk, normalize, dedupe, and return claims.
+
+    Each list item is a canonical dict (see :func:`_normalize_parsed_claim`).
+    Dedupe uses normalized ``text``; **first occurrence wins** for narrative
+    metadata when the same text appears in multiple chunks.
+    """
+    chunks = _chunk_text(transcript_text, max_chars=max_chars)
+    raw_items: List[Any] = []
 
     for chunk in chunks:
         user_prompt = _build_user_prompt(chunk)
-        last_error = None
+        last_error: Optional[Exception] = None
         for attempt in range(retries + 1):
             try:
                 raw = provider.generate_response(
                     system=_SYSTEM, user_prompt=user_prompt
                 )
                 parsed = _validate_json_output(raw)
-                all_claims.extend(parsed.get("claims", []))
+                raw_items.extend(parsed.get("claims", []))
                 break
             except Exception as e:
                 last_error = e
@@ -165,27 +422,20 @@ def _extract_insights_for_record(
                     raise last_error from last_error
 
     seen: set[str] = set()
-    unique_claims: List[Dict[str, Any]] = []
-    for c in all_claims:
-        t = c.get("text", "")
-        if t and t not in seen:
-            seen.add(t)
-            unique_claims.append(c)
-
-    return GeneratedInsights(
-        video_id=record.video_id,
-        claims=unique_claims,
-        narratives=[],
-        model=provider.model,
-        provider=provider.provider,
-        source_cleaned_txt=str(record.cleaned_txt_path),
-        source_raw_json=str(record.raw_json_path) if record.raw_json_path else None,
-        chunk_count=len(chunks),
-    )
+    unique: List[Dict[str, Any]] = []
+    for item in raw_items:
+        norm = _normalize_parsed_claim(item)
+        if norm is None:
+            continue
+        key = norm["text"]
+        if key not in seen:
+            seen.add(key)
+            unique.append(norm)
+    return unique
 
 
 # ---------------------------------------------------------------------------
-# 4. LLM Providers (public - used for provider selection)
+# 4. LLM Providers
 # ---------------------------------------------------------------------------
 
 
@@ -196,7 +446,7 @@ class OllamaProvider(LLMProvider):
 
     def __init__(
         self,
-        model: str = "llama3",
+        model: str = "qwen3",
         base_url: str = "http://localhost:11434/v1",
     ):
         super().__init__(provider="ollama", model=model)
@@ -226,7 +476,7 @@ class OllamaProvider(LLMProvider):
                 pass
             hint = ""
             if "not found" in err_msg.lower():
-                hint = " Run `ollama pull llama3` (or another model) to download a model first."
+                hint = " Run `ollama pull <model>` (see LLM_MODEL) to download a model first."
             raise RuntimeError(
                 f"Ollama API error ({resp.status_code}): {err_msg}.{hint}"
             ) from None
@@ -312,48 +562,105 @@ class BedrockProvider(LLMProvider):
                 raise RuntimeError(f"Bedrock API error: {error_msg}") from e
 
 
-# ---------------------------------------------------------------------------
-# 5. Private batch helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_transcript_records(
-    cleaned_dir: Union[str, Path],
-    raw_json_dir: Union[str, Path, None] = None,
-) -> List[TranscriptRecord]:
-    """Scan cleaned_dir (and optionally raw_json_dir) and build TranscriptRecord for each transcript."""
-    cleaned_path = Path(cleaned_dir)
-    raw_path = Path(raw_json_dir) if raw_json_dir else None
-    records: List[TranscriptRecord] = []
-    for fp in sorted(cleaned_path.glob("*.txt")):
-        video_id = fp.stem
-        raw_json = (
-            (raw_path / f"{video_id}.json") if raw_path and raw_path.exists() else None
-        )
-        records.append(
-            TranscriptRecord(
-                video_id=video_id,
-                cleaned_txt_path=fp.resolve(),
-                raw_json_path=(
-                    raw_json.resolve() if raw_json and raw_json.exists() else None
-                ),
-            )
-        )
-    return records
-
-
 def _get_provider_from_env() -> LLMProvider:
     """Create LLM provider from LLM_PROVIDER and LLM_MODEL env vars."""
-    provider_name = os.environ.get("LLM_PROVIDER", "ollama").lower()
-    model = os.environ.get("LLM_MODEL", "llama3")
+    provider_name = (os.environ.get("LLM_PROVIDER") or "ollama").lower()
+    model = os.environ.get("LLM_MODEL") or "qwen3"
+    base_url = os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
 
     if provider_name == "ollama":
-        return OllamaProvider(model=model)
+        return OllamaProvider(model=model, base_url=base_url)
     if provider_name == "bedrock":
         return BedrockProvider(model=model)
     raise ValueError(
         f"Unknown LLM_PROVIDER: {provider_name}. Use 'ollama' or 'bedrock'."
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. Supabase writes
+# ---------------------------------------------------------------------------
+
+
+def _persist_insights(
+    sb,
+    video_id: str,
+    transcript_id: str,
+    claims: List[Dict[str, Any]],
+    narrative_assignments: List[MatchDecision],
+    new_narratives: List[NarrativeCandidate],
+) -> int:
+    """Insert narratives, claims, and claim_narratives to Supabase.
+
+    *claims* must be canonical dicts from :func:`_normalize_parsed_claim` (``text``,
+    ``confidence``, narrative keys). *narrative_assignments* must be parallel to
+    *claims* and list :class:`~pipelines.narrative_matching.MatchDecision` in the
+    same order so ``zip(claim_ids, narrative_assignments)`` aligns bridge rows.
+
+    Row payloads use these Supabase columns:
+    ``claims``: ``claim_id``, ``video_id``, ``transcript_id``, ``claim_text``,
+    ``llm_confidence``, ``created_at``. ``narratives``: ``narrative_id``,
+    ``narrative_label``, ``narrative_risk_score``, ``narrative_category``,
+    ``narrative_description``, ``narrative_details``, ``created_at``.
+    ``claim_narratives``: ``claim_id``, ``narrative_id``, ``created_at``.
+
+    When a claim matched an *existing* narrative, that narrative row is not updated
+    here; only bridge rows link the new claim to the existing ``narrative_id``.
+
+    Returns the number of claims inserted.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    # 1. Insert new narratives (only rows created in this run; see MatchDecision.new_narrative)
+    if new_narratives:
+        narr_rows = [
+            {
+                "narrative_id": str(n.narrative_id),
+                "narrative_label": n.narrative_label,
+                "narrative_risk_score": n.narrative_risk_score,
+                "narrative_category": n.narrative_category,
+                "narrative_description": n.narrative_description,
+                "narrative_details": n.narrative_details,
+                "created_at": now,
+            }
+            for n in new_narratives
+        ]
+        sb.table("narratives").insert(narr_rows).execute()
+
+    # 2. Insert claims
+    claim_rows = []
+    claim_ids: List[str] = []
+    for c in claims:
+        cid = str(uuid.uuid4())
+        claim_ids.append(cid)
+        claim_rows.append(
+            {
+                "claim_id": cid,
+                "video_id": video_id,
+                "transcript_id": transcript_id,
+                "claim_text": c["text"],
+                "llm_confidence": c.get("confidence"),
+                "created_at": now,
+            }
+        )
+    if claim_rows:
+        sb.table("claims").insert(claim_rows).execute()
+
+    # 3. Insert claim_narratives bridge rows
+    bridge_rows = []
+    for cid, decision in zip(claim_ids, narrative_assignments):
+        for nid in decision.linked_narrative_ids:
+            bridge_rows.append(
+                {
+                    "claim_id": cid,
+                    "narrative_id": str(nid),
+                    "created_at": now,
+                }
+            )
+    if bridge_rows:
+        sb.table("claim_narratives").insert(bridge_rows).execute()
+
+    return len(claim_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -363,60 +670,115 @@ def _get_provider_from_env() -> LLMProvider:
 
 def run_llm_insight_generation_pipeline(
     *,
-    cleaned_dir: Union[str, Path, None] = None,
-    raw_json_dir: Union[str, Path, None] = None,
     provider: LLMProvider | None = None,
-    verbose: bool = True,
 ) -> dict:
+    """Main entrypoint for the LLM insight generation pipeline.
+
+    Reads transcripts from Supabase that have no claims yet, runs LLM
+    extraction, matches/creates narratives, and persists all rows.
+    Safe for repeated / CRON invocations: existing claims for a
+    transcript are deleted before re-inserting (replace semantics).
+
+    Semantic matches attach claims to **existing** narrative rows without
+    rewriting those rows; extraction-only narrative metadata is consumed when
+    :func:`pipelines.narrative_matching.match_claim_to_narratives` creates a **new**
+    narrative.
+
+    Run locally:
+        conda activate yt-intel-project
+        python -m pipelines.llm_insight_generation
+
+    Returns
+    -------
+    dict with keys: video_ids, total_claims, total_new_narratives
     """
-    Main entrypoint for the LLM insight generation pipeline.
-
-    Loads transcripts from storage, runs extraction per transcript via the
-    configured LLM provider, and returns a results summary. Call this from a
-    backend route or run locally via `python -m pipelines.llm_insight_generation`.
-
-    Uses LLM_PROVIDER (ollama|bedrock) and LLM_MODEL env vars when provider
-    is not passed.
-
-    Returns:
-        dict with keys: insights, video_ids, total_claims
-    """
-    cleaned = cleaned_dir or _resolve_cleaned_dir()
-    raw = raw_json_dir or _resolve_raw_json_dir()
-
-    if not Path(cleaned).exists():
-        raise FileNotFoundError(
-            f"Cleaned transcripts directory not found: {cleaned} "
-            "(run ingestion pipeline first)"
-        )
-
-    records = _build_transcript_records(cleaned, raw if Path(raw).exists() else None)
-    if not records:
-        return {"insights": [], "video_ids": [], "total_claims": 0}
-
+    sb = _get_supabase()
     prov = provider or _get_provider_from_env()
-    insights: List[GeneratedInsights] = []
 
-    for record in records:
+    transcripts = _fetch_transcripts_without_claims(sb)
+    if not transcripts:
+        log.info("No unprocessed transcripts found.")
+        return {"video_ids": [], "total_claims": 0, "total_new_narratives": 0}
+
+    log.info("Processing %d transcript(s)", len(transcripts))
+
+    existing_narr_rows = _fetch_all_narratives(sb)
+    embedder = get_embedder_from_env()
+    candidates, candidate_embeddings = build_candidate_pool(
+        existing_narr_rows, embedder=embedder
+    )
+
+    total_claims = 0
+    total_new_narratives = 0
+    processed_video_ids: List[str] = []
+
+    for t in transcripts:
+        video_id = t["video_id"]
+        transcript_id = str(t["transcript_id"])
+        text = t["cleaned_transcript_txt"]
+
         try:
-            result = _extract_insights_for_record(record, prov)
-            insights.append(result)
-            if verbose:
-                print(
-                    f"  {record.video_id}: {len(result.claims)} claims, "
-                    f"{result.chunk_count} chunks"
-                )
-        except Exception as e:
-            if verbose:
-                print(f"  {record.video_id}: ERROR - {e}")
+            _delete_existing_insights(sb, transcript_id)
 
-    total_claims = sum(len(i.claims) for i in insights)
+            claims = _extract_claims(text, prov)
+            if not claims:
+                log.info("%s: 0 claims extracted, skipping.", video_id)
+                continue
+
+            decisions: List[MatchDecision] = []
+            run_new_narratives: List[NarrativeCandidate] = []
+
+            for c in claims:
+                decision = match_claim_to_narratives(
+                    claim_text=c["text"],
+                    narrative_theme=c.get("narrative_theme"),
+                    candidates=candidates,
+                    candidate_embeddings=candidate_embeddings,
+                    embedder=embedder,
+                    narrative_category=c.get("narrative_category"),
+                    narrative_description=c.get("narrative_description"),
+                    narrative_details=c.get("narrative_details"),
+                )
+                decisions.append(decision)
+                log.debug(
+                    "Claim match top_similarity=%s",
+                    decision.top_similarity,
+                )
+                if decision.new_narrative:
+                    run_new_narratives.append(decision.new_narrative)
+                    candidate_embeddings = refresh_pool_with_new(
+                        candidates,
+                        candidate_embeddings,
+                        decision.new_narrative,
+                        embedder=embedder,
+                    )
+
+            inserted = _persist_insights(
+                sb, video_id, transcript_id, claims, decisions, run_new_narratives
+            )
+            total_claims += inserted
+            total_new_narratives += len(run_new_narratives)
+            processed_video_ids.append(video_id)
+            log.info(
+                "%s: %d claims, %d new narratives",
+                video_id,
+                inserted,
+                len(run_new_narratives),
+            )
+        except Exception:
+            log.exception("Failed to process %s", video_id)
+
     return {
-        "insights": insights,
-        "video_ids": [i.video_id for i in insights],
+        "video_ids": processed_video_ids,
         "total_claims": total_claims,
+        "total_new_narratives": total_new_narratives,
     }
 
 
 if __name__ == "__main__":
-    run_llm_insight_generation_pipeline()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    )
+    result = run_llm_insight_generation_pipeline()
+    log.info("Pipeline complete: %s", result)

@@ -9,7 +9,7 @@ class Video(SQLModel, table=True):
     __tablename__ = "videos"
 
     video_id: str = Field(primary_key=True)
-    channel_id: str = Field(foreign_key="channels.channel_id")
+    channel_id: str
     channel_title: Optional[str] = None
     title: str
     category_id: Optional[str] = None
