@@ -469,7 +469,6 @@ _claim_sentiment_pipeline = None
 def _get_claim_sentiment_pipeline():
     global _claim_sentiment_pipeline
     if _claim_sentiment_pipeline is None:
-
         print("Loading sentiment model for claims...")
         _claim_sentiment_pipeline = hf_pipeline(  # type: ignore[call-overload]
             "sentiment-analysis",

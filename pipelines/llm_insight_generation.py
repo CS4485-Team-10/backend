@@ -254,49 +254,43 @@ class BedrockProvider(LLMProvider):
                     "boto3 is required for BedrockProvider. "
                     "Install it with: pip install boto3"
                 ) from None
-            
+
             self._client = boto3.client(
-                service_name="bedrock-runtime",
-                region_name=self.region
+                service_name="bedrock-runtime", region_name=self.region
             )
         return self._client
 
     def generate_response(self, *, system: str, user_prompt: str) -> str:
         """
         Call Amazon Bedrock Converse API.
-        
+
         Uses AWS credentials from environment (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
         or from ~/.aws/credentials file.
         """
         client = self._get_client()
-        
+
         try:
             response = client.converse(
                 modelId=self.model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [{"text": user_prompt}]
-                    }
-                ],
+                messages=[{"role": "user", "content": [{"text": user_prompt}]}],
                 system=[{"text": system}],
                 inferenceConfig={
                     "temperature": 0.3,
                     "maxTokens": 4096,
-                }
+                },
             )
-            
+
             # Extract text from response
             output = response.get("output", {})
             message = output.get("message", {})
             content = message.get("content", [])
-            
+
             if not content:
                 raise RuntimeError("Bedrock returned empty response")
-            
+
             # Get the text from first content block
             return content[0].get("text", "")
-            
+
         except Exception as e:
             # Provide helpful error messages
             error_msg = str(e)
@@ -306,7 +300,10 @@ class BedrockProvider(LLMProvider):
                     "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables "
                     "or configure ~/.aws/credentials"
                 ) from e
-            elif "ResourceNotFoundException" in error_msg or "ValidationException" in error_msg:
+            elif (
+                "ResourceNotFoundException" in error_msg
+                or "ValidationException" in error_msg
+            ):
                 raise RuntimeError(
                     f"Model '{self.model}' not found in region '{self.region}'. "
                     "Verify model ID and ensure you have access to it in Bedrock."
@@ -331,9 +328,7 @@ def _build_transcript_records(
     for fp in sorted(cleaned_path.glob("*.txt")):
         video_id = fp.stem
         raw_json = (
-            (raw_path / f"{video_id}.json")
-            if raw_path and raw_path.exists()
-            else None
+            (raw_path / f"{video_id}.json") if raw_path and raw_path.exists() else None
         )
         records.append(
             TranscriptRecord(
@@ -395,9 +390,7 @@ def run_llm_insight_generation_pipeline(
             "(run ingestion pipeline first)"
         )
 
-    records = _build_transcript_records(
-        cleaned, raw if Path(raw).exists() else None
-    )
+    records = _build_transcript_records(cleaned, raw if Path(raw).exists() else None)
     if not records:
         return {"insights": [], "video_ids": [], "total_claims": 0}
 

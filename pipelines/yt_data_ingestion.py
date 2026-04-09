@@ -78,18 +78,14 @@ def _compute_impact_features(vid_metadata: dict) -> dict:
     view_count = int(stats.get("viewCount", 0))
     comment_count = int(stats.get("commentCount", 0))
     like_count = int(stats.get("likeCount", 0))
-    published_at = datetime.fromisoformat(
-        snippet["publishedAt"].replace("Z", "+00:00")
-    )
+    published_at = datetime.fromisoformat(snippet["publishedAt"].replace("Z", "+00:00"))
     days_since = max(
         (datetime.now(timezone.utc) - published_at).days,
         1,
     )
 
     views_per_day = view_count / days_since
-    comments_per_1kviews = (
-        (comment_count / view_count) * 1000 if view_count > 0 else 0
-    )
+    comments_per_1kviews = (comment_count / view_count) * 1000 if view_count > 0 else 0
     likes_per_1kviews = (like_count / view_count) * 1000 if view_count > 0 else 0
 
     reach = math.log10(view_count + 1)
@@ -115,9 +111,7 @@ def _filter_ws_by_percentile(
     """Keep videos above the given percentile of impact_score (e.g. 0.9 = top 10%)."""
     if not scored_videos:
         return []
-    scored_videos = sorted(
-        scored_videos, key=lambda x: x["impact_score"], reverse=True
-    )
+    scored_videos = sorted(scored_videos, key=lambda x: x["impact_score"], reverse=True)
     cutoff_index = min(
         int(len(scored_videos) * percentile),
         len(scored_videos) - 1,
@@ -136,9 +130,7 @@ def _clean_transcript(transcript_data: Union[List[Dict], str]) -> str:
             for item in transcript_data
         )
     text = re.sub(r"^>\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(
-        r"(?:^|\s)(?:[A-Z][a-z]*(?:\s+[A-Z][a-z]*)?)\s*:\s*", " ", text
-    )
+    text = re.sub(r"(?:^|\s)(?:[A-Z][a-z]*(?:\s+[A-Z][a-z]*)?)\s*:\s*", " ", text)
     text = re.sub(r"\[[^\]]*\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\([^)]*\)", "", text)
     for pattern in [
@@ -175,9 +167,7 @@ def _get_llm_provider_for_filtering() -> LLMProvider:
     return OllamaProvider(model=model)
 
 
-def _parse_semantic_filter_response(
-    raw: str, video_ids: List[str]
-) -> Dict[str, dict]:
+def _parse_semantic_filter_response(raw: str, video_ids: List[str]) -> Dict[str, dict]:
     """
     Parse LLM classification response. Returns dict mapping video_id -> {is_relevant, reason, confidence}.
     Fails closed: malformed or missing entries are treated as not relevant.
@@ -196,7 +186,11 @@ def _parse_semantic_filter_response(
     except json.JSONDecodeError:
         return result
 
-    items = parsed if isinstance(parsed, list) else parsed.get("results", parsed.get("items", []))
+    items = (
+        parsed
+        if isinstance(parsed, list)
+        else parsed.get("results", parsed.get("items", []))
+    )
     if not isinstance(items, list):
         return result
 
@@ -247,19 +241,23 @@ def filter_videos_by_public_health_relevance(
         batch = video_metadata[i : i + batch_size]
         batch_ids = [v["id"] for v in batch]
         titles = [
-            v.get("snippet", {}).get("title", "")[:200] or "(no title)"
-            for v in batch
+            v.get("snippet", {}).get("title", "")[:200] or "(no title)" for v in batch
         ]
         descriptions = [
-            (v.get("snippet", {}).get("description", "") or "")[:300]
-            for v in batch
+            (v.get("snippet", {}).get("description", "") or "")[:300] for v in batch
         ]
 
-        user_prompt = "Classify each video for public health relevance. Return a JSON array.\n\n"
+        user_prompt = (
+            "Classify each video for public health relevance. Return a JSON array.\n\n"
+        )
         for j, (vid, title, desc) in enumerate(zip(batch_ids, titles, descriptions)):
-            user_prompt += f"{j+1}. video_id: {vid}\n   title: {title}\n"
+            user_prompt += f"{j + 1}. video_id: {vid}\n   title: {title}\n"
             if desc:
-                user_prompt += f"   description: {desc[:150]}...\n" if len(desc) > 150 else f"   description: {desc}\n"
+                user_prompt += (
+                    f"   description: {desc[:150]}...\n"
+                    if len(desc) > 150
+                    else f"   description: {desc}\n"
+                )
             user_prompt += "\n"
 
         user_prompt += '\nReturn JSON array: [{"video_id":"...","is_relevant":bool,"reason":"...","confidence":0.0-1.0}, ...]'
@@ -271,10 +269,16 @@ def filter_videos_by_public_health_relevance(
             classifications = _parse_semantic_filter_response(raw, batch_ids)
             for vid in batch_ids:
                 c = classifications.get(vid)
-                if c and c.get("is_relevant") and c.get("confidence", 0) >= min_confidence:
+                if (
+                    c
+                    and c.get("is_relevant")
+                    and c.get("confidence", 0) >= min_confidence
+                ):
                     kept.append(video_by_id[vid])
                 elif verbose:
-                    reason = c.get("reason", "no classification") if c else "parse skipped"
+                    reason = (
+                        c.get("reason", "no classification") if c else "parse skipped"
+                    )
                     print(f"  [filtered] {vid}: {reason[:80]}")
         except Exception as e:
             if verbose:
@@ -293,9 +297,9 @@ def _fetch_candidate_video_ids(
     max_search_pages: int = 10,
 ) -> List[str]:
     """Fetch candidate video IDs from YouTube search API (paginated)."""
-    six_months_ago = (
-        datetime.now(timezone.utc) - timedelta(days=180)
-    ).strftime("%Y-%m-%dT00:00:00Z")
+    six_months_ago = (datetime.now(timezone.utc) - timedelta(days=180)).strftime(
+        "%Y-%m-%dT00:00:00Z"
+    )
 
     all_items: List[dict] = []
     page_token = None
@@ -462,21 +466,15 @@ def run_youtube_data_ingestion_pipeline(
         print(f"After impact filter: {len(filtered_ids)} high-impact")
 
     formatter = JSONFormatter()
-    transcripts_saved = _save_transcripts(
-        filtered_ids, formatter, verbose=verbose
-    )
+    transcripts_saved = _save_transcripts(filtered_ids, formatter, verbose=verbose)
     comments_saved = _save_comments(youtube, filtered_ids)
 
     if verbose:
         raw_count = sum(
-            1
-            for p in (DATA_ROOT / "transcripts" / "raw").iterdir()
-            if p.is_file()
+            1 for p in (DATA_ROOT / "transcripts" / "raw").iterdir() if p.is_file()
         )
         cleaned_count = sum(
-            1
-            for p in (DATA_ROOT / "transcripts" / "cleaned").iterdir()
-            if p.is_file()
+            1 for p in (DATA_ROOT / "transcripts" / "cleaned").iterdir() if p.is_file()
         )
         if raw_count == cleaned_count:
             print(f"Verification: {raw_count} files in both directories.")

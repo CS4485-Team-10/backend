@@ -1,4 +1,3 @@
-
 import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -33,7 +32,9 @@ def ingest_video(payload: IngestVideoRequest):
     try:
         payload = run_pipeline(api_key, video_id)
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail="YouTube API error")
+        raise HTTPException(
+            status_code=e.response.status_code, detail="YouTube API error"
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except TranscriptErrors as e:
