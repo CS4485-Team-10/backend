@@ -140,12 +140,14 @@ def _compute_impact_features(vid_metadata: dict) -> dict:
     comment_count = int(stats.get("commentCount", 0))
     like_count = int(stats.get("likeCount", 0))
     published_at = datetime.fromisoformat(snippet["publishedAt"].replace("Z", "+00:00"))
+    published_at = datetime.fromisoformat(snippet["publishedAt"].replace("Z", "+00:00"))
     days_since = max(
         (datetime.now(timezone.utc) - published_at).days,
         1,
     )
 
     views_per_day = view_count / days_since
+    comments_per_1kviews = (comment_count / view_count) * 1000 if view_count > 0 else 0
     comments_per_1kviews = (comment_count / view_count) * 1000 if view_count > 0 else 0
     likes_per_1kviews = (like_count / view_count) * 1000 if view_count > 0 else 0
 
@@ -175,6 +177,7 @@ def _filter_ws_by_percentile(
     if not scored_videos:
         return []
     scored_videos = sorted(scored_videos, key=lambda x: x["impact_score"], reverse=True)
+    scored_videos = sorted(scored_videos, key=lambda x: x["impact_score"], reverse=True)
     cutoff_index = min(
         int(len(scored_videos) * percentile),
         len(scored_videos) - 1,
@@ -193,6 +196,7 @@ def _clean_transcript(transcript_data: Union[List[Dict], str]) -> str:
             for item in transcript_data
         )
     text = re.sub(r"^>\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"(?:^|\s)(?:[A-Z][a-z]*(?:\s+[A-Z][a-z]*)?)\s*:\s*", " ", text)
     text = re.sub(r"(?:^|\s)(?:[A-Z][a-z]*(?:\s+[A-Z][a-z]*)?)\s*:\s*", " ", text)
     text = re.sub(r"\[[^\]]*\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\([^)]*\)", "", text)
@@ -274,6 +278,11 @@ def _parse_semantic_filter_response(raw: str, video_ids: List[str]) -> Dict[str,
         if isinstance(parsed, list)
         else parsed.get("results", parsed.get("items", []))
     )
+    items = (
+        parsed
+        if isinstance(parsed, list)
+        else parsed.get("results", parsed.get("items", []))
+    )
     if not isinstance(items, list):
         return result
 
@@ -333,9 +342,18 @@ def filter_videos_by_public_health_relevance(
         user_prompt = (
             "Classify each video for public health relevance. Return a JSON array.\n\n"
         )
+        user_prompt = (
+            "Classify each video for public health relevance. Return a JSON array.\n\n"
+        )
         for j, (vid, title, desc) in enumerate(zip(batch_ids, titles, descriptions)):
             user_prompt += f"{j + 1}. video_id: {vid}\n   title: {title}\n"
+            user_prompt += f"{j + 1}. video_id: {vid}\n   title: {title}\n"
             if desc:
+                user_prompt += (
+                    f"   description: {desc[:150]}...\n"
+                    if len(desc) > 150
+                    else f"   description: {desc}\n"
+                )
                 user_prompt += (
                     f"   description: {desc[:150]}...\n"
                     if len(desc) > 150
@@ -359,6 +377,9 @@ def filter_videos_by_public_health_relevance(
                 ):
                     kept.append(video_by_id[vid])
                 elif verbose:
+                    reason = (
+                        c.get("reason", "no classification") if c else "parse skipped"
+                    )
                     reason = (
                         c.get("reason", "no classification") if c else "parse skipped"
                     )
