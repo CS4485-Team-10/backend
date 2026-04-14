@@ -1,30 +1,4 @@
-"""Semantic narrative matching for claim → narrative assignment.
-
-When the LLM pipeline creates a **new** narrative, optional first-pass fields
-(``narrative_category``, ``narrative_description``, ``narrative_details``) populate
-that insert; linking to an existing narrative never updates the stored row.
-
-Compares each claim against existing narratives using sentence embeddings
-and cosine similarity, then decides whether to reuse existing narratives
-or create new ones. Supports many-to-many linking (one claim can map to
-multiple narratives).
-
-Embeddings are used only for semantic narrative deduplication/linking, not
-for LLM claim extraction.
-
-Configure via ``NARR_EMBEDDING_BACKEND`` (default: ``remote``):
-
-- **remote** (production default): calls **Google Gemini** ``embedContent`` over HTTP.
-  Set ``NARR_EMBEDDING_URL`` to the full REST path, e.g.
-  ``https://generativelanguage.googleapis.com/v1beta/models/<embedding-model>:embedContent``.
-  Set ``NARR_EMBEDDING_API_KEY`` to your Google AI API key (sent as ``x-goog-api-key``).
-  ``NARR_EMBEDDING_MODEL`` should match the model id in the URL (optional but logged);
-  ``NARR_EMBEDDING_TIMEOUT`` is the per-request timeout in seconds (default 60).
-  Each string in ``encode(texts)`` is embedded with a separate ``embedContent`` call;
-  vectors are stacked, validated, and L2-normalized for cosine similarity.
-
-Only the ``remote`` backend is supported (no local heavyweight embedding stack).
-"""
+"""Match claims to existing narratives or create new ones."""
 
 from __future__ import annotations
 
@@ -76,7 +50,7 @@ def _validate_embeddings(texts: List[str], arr: np.ndarray) -> None:
 
 @dataclass
 class NarrativeCandidate:
-    """An existing or newly-created narrative with its text for embedding."""
+    """Narrative candidate used during matching."""
 
     narrative_id: uuid.UUID
     narrative_label: str
@@ -88,7 +62,7 @@ class NarrativeCandidate:
 
     @property
     def embed_text(self) -> str:
-        """Text used for narrative embedding (label, category, optional description/details)."""
+        """Build embedding text from narrative fields."""
         parts = [self.narrative_label, self.narrative_category]
         if self.narrative_description:
             parts.append(self.narrative_description)
@@ -99,7 +73,7 @@ class NarrativeCandidate:
 
 @dataclass
 class MatchDecision:
-    """Result of matching one claim against the narrative pool."""
+    """Result for one claim match."""
 
     linked_narrative_ids: List[uuid.UUID] = field(default_factory=list)
     new_narrative: Optional[NarrativeCandidate] = None
@@ -112,15 +86,15 @@ class MatchDecision:
 
 
 class BaseEmbedder(ABC):
-    """Pluggable text encoder; implementations return L2-normalized (N, D) arrays."""
+    """Text encoder interface."""
 
     @abstractmethod
     def encode(self, texts: List[str]) -> np.ndarray:
-        """L2-normalized embedding matrix for *texts*."""
+        """Return L2-normalized embeddings."""
 
 
 def _gemini_error_detail(resp: Any) -> str:
-    """Best-effort message from a failed Gemini HTTP response."""
+    """Extract a short Gemini error string."""
     try:
         data = resp.json()
         err = data.get("error")
@@ -132,7 +106,7 @@ def _gemini_error_detail(resp: Any) -> str:
 
 
 class RemoteEmbedder(BaseEmbedder):
-    """Google Gemini ``embedContent`` client (see module docstring)."""
+    """Gemini embedContent client."""
 
     def __init__(
         self,
@@ -151,7 +125,7 @@ class RemoteEmbedder(BaseEmbedder):
         self._timeout = timeout_seconds
 
     def _embed_one(self, text: str) -> np.ndarray:
-        """Single Gemini ``embedContent`` call; returns a 1-D float vector (not normalized)."""
+        """Call Gemini once and return one raw vector."""
         body: Dict[str, Any] = {
             "content": {"parts": [{"text": text}]},
             "taskType": "SEMANTIC_SIMILARITY",
@@ -269,10 +243,7 @@ def get_embedder_from_env() -> BaseEmbedder:
 
 
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Cosine similarities between a single vector *a* (1-D) and matrix *b* (N x D).
-
-    Both inputs are assumed L2-normalized, so dot product == cosine similarity.
-    """
+    """Return cosine similarity of one vector vs many."""
     return b @ a
 
 
@@ -292,28 +263,7 @@ def match_claim_to_narratives(
     narrative_description: Optional[str] = None,
     narrative_details: Optional[str] = None,
 ) -> MatchDecision:
-    """Decide which existing narratives a claim links to, or create a new one.
-
-    Parameters
-    ----------
-    claim_text:
-        The raw claim text extracted by the LLM.
-    narrative_theme:
-        Optional short theme string the LLM may have provided for this claim.
-    candidates:
-        All known narratives (existing DB rows + any created during this run).
-    candidate_embeddings:
-        Pre-computed embeddings for *candidates*, same order / length.
-    embedder:
-        Encoder used to embed the claim (+ theme) for similarity against the pool.
-    narrative_category, narrative_description, narrative_details:
-        Optional first-pass narrative metadata used only when creating a *new*
-        narrative row. They do not update existing narrative rows when a match is found.
-
-    Returns
-    -------
-    MatchDecision with linked IDs and optionally a new NarrativeCandidate.
-    """
+    """Link a claim to existing narratives or create one."""
     if not candidates:
         new_narr = _build_new_narrative(
             claim_text,
@@ -373,7 +323,7 @@ def _build_new_narrative(
     narrative_description: Optional[str] = None,
     narrative_details: Optional[str] = None,
 ) -> NarrativeCandidate:
-    """Build a new narrative from first-pass claim metadata (not used to update existing rows)."""
+    """Build a new narrative candidate."""
     label = (
         narrative_theme if narrative_theme else claim_text[:_MAX_FALLBACK_LABEL_CHARS]
     )
@@ -394,22 +344,7 @@ def build_candidate_pool(
     *,
     embedder: BaseEmbedder,
 ) -> tuple[List[NarrativeCandidate], np.ndarray]:
-    """Convert Supabase narrative rows into candidates + their embeddings.
-
-    Parameters
-    ----------
-    existing_rows:
-        Dicts with at least ``narrative_id``, ``narrative_label``,
-        ``narrative_risk_score`` (or legacy ``narrative_risk``), and optional
-        description/category/details fields.
-    embedder:
-        Encoder used to embed narrative ``embed_text`` strings.
-
-    Returns
-    -------
-    (candidates, embeddings) — embeddings are L2-normalized (N x D).
-    Returns empty arrays when there are no existing rows.
-    """
+    """Convert DB narrative rows to candidates and embeddings."""
 
     def _risk_score_from_row(r: Dict[str, Any]) -> float:
         v = r.get("narrative_risk_score")
@@ -446,10 +381,7 @@ def refresh_pool_with_new(
     *,
     embedder: BaseEmbedder,
 ) -> np.ndarray:
-    """Append a newly-created narrative to the in-memory pool.
-
-    Mutates *candidates* in-place and returns the updated embeddings matrix.
-    """
+    """Append a new narrative and return updated embeddings."""
     candidates.append(new_narrative)
     new_emb = embedder.encode([new_narrative.embed_text])
     if embeddings.size == 0:

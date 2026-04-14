@@ -1,4 +1,4 @@
-# Suppress noisy model output first (before any transformers imports)
+# Reduce transformer logging noise.
 import os
 import sys
 
@@ -23,8 +23,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 SUPABASE_TABLE_VIDEOS = "videos"
 
-# using cardiffnlp because it gives us 3 classes (neg/neu/pos) instead of just pos/neg
-# this lets us compute a real gradient: POS - NEG gives a -1 to +1 range
+# Use 3-way sentiment and collapse to POS-NEG gradient.
 sentiment_analyzer = pipeline(  # type: ignore[call-overload, arg-type]
     "sentiment-analysis",  # type: ignore[arg-type]
     model="cardiffnlp/twitter-roberta-base-sentiment-latest",
@@ -45,7 +44,6 @@ def clean_transcript(transcript) -> str:
 
 
 def chunk_text(text: str, chunk_size: int = 300) -> list:
-    # 300 words per chunk works well, model cap is 512 tokens
     words = text.split()
     return [
         " ".join(words[i : i + chunk_size]) for i in range(0, len(words), chunk_size)
@@ -53,17 +51,12 @@ def chunk_text(text: str, chunk_size: int = 300) -> list:
 
 
 def chunk_to_gradient(all_class_scores: list) -> float:
-    # takes the 3-class output and collapses it to a single number
-    # neutral is intentionally dropped -- we only care about the pos/neg split
-    # result is in -1.0 to +1.0 range
     scores = {r["label"].lower(): r["score"] for r in all_class_scores}
     return round(scores.get("positive", 0.0) - scores.get("negative", 0.0), 4)
 
 
 def analyze_video_sentiment(video_id: str) -> dict:
-    # First try to get transcript from Supabase, fall back to YouTube if not found
     try:
-        # Try Supabase first
         client = get_supabase_client()
         result = (
             client.table("transcripts")
@@ -75,7 +68,6 @@ def analyze_video_sentiment(video_id: str) -> dict:
         if result.data and len(result.data) > 0:
             cleaned_text = result.data[0]["cleaned_transcript_txt"]
         else:
-            # Fall back to YouTube API
             try:
                 transcript = ytt_api.fetch(video_id, languages=["en"])
             except Exception:
@@ -93,7 +85,6 @@ def analyze_video_sentiment(video_id: str) -> dict:
         negative_chunks = sum(1 for s in chunk_scores if s <= 0)
         avg_score = round(sum(chunk_scores) / len(chunk_scores), 4)
 
-        # anything within 0.1 of zero we just call neutral, too noisy otherwise
         if avg_score > 0.1:
             overall_sentiment = "POSITIVE"
         elif avg_score < -0.1:
@@ -115,9 +106,7 @@ def analyze_video_sentiment(video_id: str) -> dict:
         return {"error": f"Failed to process video {video_id}: {str(e)}"}
 
 
-# VIDEO ID SOURCES
 def ids_from_file(filepath: str) -> list[str]:
-    # one video ID per line, # for comments, blank lines ignored
     path = Path(filepath)
     if not path.exists():
         print(f"Error: File '{filepath}' not found.")
@@ -152,7 +141,6 @@ def get_supabase_client():
 
 
 def ids_from_supabase_all_videos() -> list[str]:
-    # get all video IDs from the videos table
     client = get_supabase_client()
     all_videos = client.table(SUPABASE_TABLE_VIDEOS).select("video_id").execute()
     video_ids = [str(r["video_id"]) for r in all_videos.data]  # type: ignore[index]
@@ -163,11 +151,10 @@ def ids_from_supabase_all_videos() -> list[str]:
 def save_sentiment_to_json(
     results: list[dict], output_path: str = "video_sentiment_results.json"
 ):
-    """Save video sentiment results to JSON file for analytics."""
+    """Save valid sentiment results to JSON."""
     if not results:
         return
 
-    # Filter out errors
     valid_results = [r for r in results if "error" not in r]
 
     if not valid_results:
@@ -195,7 +182,7 @@ if __name__ == "__main__":
         video_ids = ids_from_file(sys.argv[2])
     elif mode == "2":
         video_ids = ids_from_supabase_all_videos()
-        save_json = True  # always save when pulling from supabase
+        save_json = True
     else:
         print(f"Unknown mode '{mode}'. Use: no args | 1 <file> [--save] | 2")
         sys.exit(1)
@@ -215,7 +202,6 @@ if __name__ == "__main__":
         print_result(result)
         all_results.append(result)
 
-    # Summary
     successes = [r for r in all_results if "error" not in r]
     failures = len(all_results) - len(successes)
     if successes:
@@ -230,8 +216,3 @@ if __name__ == "__main__":
             save_sentiment_to_json(all_results, output_file)
     else:
         print(f"\nNo videos could be analyzed ({failures} failed).")
-
-# Usage:
-#   python sentiment_analysis.py                -> test single video (console output only)
-#   python sentiment_analysis.py 1 ids.txt      -> from file (add --save for JSON output)
-#   python sentiment_analysis.py 2              -> from supabase (auto-save to JSON)

@@ -1,25 +1,4 @@
-"""
-LLM Insight Generation Pipeline.
-
-Reads transcripts from Supabase (only those without existing claims),
-extracts claims via an LLM, semantically matches or creates narratives,
-and persists claims, narratives, and claim_narratives back to Supabase.
-
-**First-pass ownership:** this module normalizes LLM JSON, writes ``claim_text`` and
-``llm_confidence``, and inserts *new* narrative rows from extraction metadata when
-no semantic match exists. Sentiment, fact-check, and risk enrichment are owned by
-other pipelines and are not applied here.
-Narrative embeddings are only used for semantic matching/dedup against
-existing narrative rows, not for LLM extraction. Production defaults to
-``NARR_EMBEDDING_BACKEND=remote`` (Google Gemini ``embedContent``): set
-``NARR_EMBEDDING_URL`` to the full ``.../models/<id>:embedContent`` URL,
-``NARR_EMBEDDING_API_KEY`` (Google AI key, ``x-goog-api-key``), and optionally
-``NARR_EMBEDDING_MODEL``, ``NARR_EMBEDDING_TIMEOUT`` (see
-``pipelines.narrative_matching``).
-
-Re-runs are safe: prior claims and bridge rows for a transcript are
-deleted before new ones are inserted (replace semantics for CRON jobs).
-"""
+"""Extract claims, match narratives, and persist first-pass insights."""
 
 from __future__ import annotations
 
@@ -105,7 +84,7 @@ def _normalize_confidence(raw: Any) -> Optional[float]:
 
 
 def _normalize_parsed_claim(raw: Any) -> Optional[Dict[str, Any]]:
-    """Return a canonical claim dict, or None if the entry is unusable."""
+    """Return a canonical claim dict, or None."""
     if not isinstance(raw, dict):
         log.debug("Skipping non-dict claim entry: %s", type(raw).__name__)
         return None
@@ -153,12 +132,7 @@ def _get_supabase():
 
 
 def _fetch_transcripts_without_claims(sb) -> List[Dict[str, Any]]:
-    """Return transcripts rows that have no corresponding claims yet.
-
-    Uses Supabase PostgREST: fetch all transcripts, then subtract those
-    whose transcript_id already appears in claims (set difference in Python
-    since PostgREST has limited subquery support).
-    """
+    """Return transcript rows with no matching claims."""
     all_transcripts: List[Dict[str, Any]] = []
     offset = 0
     while True:
@@ -195,7 +169,7 @@ def _fetch_transcripts_without_claims(sb) -> List[Dict[str, Any]]:
 
 
 def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
-    """Paginated fetch of all rows from the narratives table."""
+    """Return all narrative rows via pagination."""
     rows: List[Dict[str, Any]] = []
     offset = 0
     while True:
@@ -216,12 +190,12 @@ def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Replace-semantics: delete old insights for a transcript
+# 2. Replace existing transcript claims
 # ---------------------------------------------------------------------------
 
 
 def _delete_existing_insights(sb, transcript_id: str) -> None:
-    """Remove claim_narratives and claims for *transcript_id* (FK-safe order)."""
+    """Delete old bridge rows and claims for a transcript."""
     existing_claims = (
         sb.table("claims")
         .select("claim_id")
@@ -243,7 +217,7 @@ def _delete_existing_insights(sb, transcript_id: str) -> None:
 
 
 def _chunk_text(text: str, max_chars: int = 12000) -> List[str]:
-    """Split long transcript text into chunks to fit model context limits."""
+    """Split transcript text into model-sized chunks."""
     paragraphs = text.split("\n\n")
     chunks: List[str] = []
     buffer: List[str] = []
@@ -374,7 +348,7 @@ Transcript:
 
 
 def _validate_json_output(text: str) -> Dict[str, Any]:
-    """Parse and validate the LLM JSON output."""
+    """Parse and validate JSON output."""
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
@@ -396,12 +370,7 @@ def _extract_claims(
     max_chars: int = 12000,
     retries: int = 2,
 ) -> List[Dict[str, Any]]:
-    """Chunk transcript, call LLM per chunk, normalize, dedupe, and return claims.
-
-    Each list item is a canonical dict (see :func:`_normalize_parsed_claim`).
-    Dedupe uses normalized ``text``; **first occurrence wins** for narrative
-    metadata when the same text appears in multiple chunks.
-    """
+    """Chunk transcript, call LLM, normalize, dedupe, return claims."""
     chunks = _chunk_text(transcript_text, max_chars=max_chars)
     raw_items: List[Any] = []
 
@@ -440,7 +409,7 @@ def _extract_claims(
 
 
 class OllamaProvider(LLMProvider):
-    """Calls local Ollama using an OpenAI-compatible endpoint."""
+    """Call local Ollama using OpenAI-compatible API."""
 
     name = "ollama"
 
@@ -485,7 +454,7 @@ class OllamaProvider(LLMProvider):
 
 
 class BedrockProvider(LLMProvider):
-    """Calls Amazon Bedrock using the Converse API with Qwen3-VL-235B-A22B or other models."""
+    """Call Amazon Bedrock Converse API."""
 
     name = "bedrock"
 
@@ -495,7 +464,7 @@ class BedrockProvider(LLMProvider):
         self._client = None
 
     def _get_client(self):
-        """Lazy-load boto3 client (only imported when BedrockProvider is used)."""
+        """Lazy-load boto3 client."""
         if self._client is None:
             try:
                 import boto3
@@ -511,12 +480,7 @@ class BedrockProvider(LLMProvider):
         return self._client
 
     def generate_response(self, *, system: str, user_prompt: str) -> str:
-        """
-        Call Amazon Bedrock Converse API.
-
-        Uses AWS credentials from environment (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-        or from ~/.aws/credentials file.
-        """
+        """Call Bedrock and return model text."""
         client = self._get_client()
 
         try:
@@ -530,7 +494,6 @@ class BedrockProvider(LLMProvider):
                 },
             )
 
-            # Extract text from response
             output = response.get("output", {})
             message = output.get("message", {})
             content = message.get("content", [])
@@ -538,11 +501,9 @@ class BedrockProvider(LLMProvider):
             if not content:
                 raise RuntimeError("Bedrock returned empty response")
 
-            # Get the text from first content block
             return content[0].get("text", "")
 
         except Exception as e:
-            # Provide helpful error messages
             error_msg = str(e)
             if "AccessDeniedException" in error_msg:
                 raise RuntimeError(
@@ -563,7 +524,7 @@ class BedrockProvider(LLMProvider):
 
 
 def _get_provider_from_env() -> LLMProvider:
-    """Create LLM provider from LLM_PROVIDER and LLM_MODEL env vars."""
+    """Build provider from environment settings."""
     provider_name = (os.environ.get("LLM_PROVIDER") or "ollama").lower()
     model = os.environ.get("LLM_MODEL") or "qwen3"
     base_url = os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
@@ -590,28 +551,9 @@ def _persist_insights(
     narrative_assignments: List[MatchDecision],
     new_narratives: List[NarrativeCandidate],
 ) -> int:
-    """Insert narratives, claims, and claim_narratives to Supabase.
-
-    *claims* must be canonical dicts from :func:`_normalize_parsed_claim` (``text``,
-    ``confidence``, narrative keys). *narrative_assignments* must be parallel to
-    *claims* and list :class:`~pipelines.narrative_matching.MatchDecision` in the
-    same order so ``zip(claim_ids, narrative_assignments)`` aligns bridge rows.
-
-    Row payloads use these Supabase columns:
-    ``claims``: ``claim_id``, ``video_id``, ``transcript_id``, ``claim_text``,
-    ``llm_confidence``, ``created_at``. ``narratives``: ``narrative_id``,
-    ``narrative_label``, ``narrative_risk_score``, ``narrative_category``,
-    ``narrative_description``, ``narrative_details``, ``created_at``.
-    ``claim_narratives``: ``claim_id``, ``narrative_id``, ``created_at``.
-
-    When a claim matched an *existing* narrative, that narrative row is not updated
-    here; only bridge rows link the new claim to the existing ``narrative_id``.
-
-    Returns the number of claims inserted.
-    """
+    """Insert narratives, claims, and bridge rows."""
     now = datetime.now(timezone.utc).isoformat()
 
-    # 1. Insert new narratives (only rows created in this run; see MatchDecision.new_narrative)
     if new_narratives:
         narr_rows = [
             {
@@ -627,7 +569,6 @@ def _persist_insights(
         ]
         sb.table("narratives").insert(narr_rows).execute()
 
-    # 2. Insert claims
     claim_rows = []
     claim_ids: List[str] = []
     for c in claims:
@@ -646,7 +587,6 @@ def _persist_insights(
     if claim_rows:
         sb.table("claims").insert(claim_rows).execute()
 
-    # 3. Insert claim_narratives bridge rows
     bridge_rows = []
     for cid, decision in zip(claim_ids, narrative_assignments):
         for nid in decision.linked_narrative_ids:
@@ -672,26 +612,7 @@ def run_llm_insight_generation_pipeline(
     *,
     provider: LLMProvider | None = None,
 ) -> dict:
-    """Main entrypoint for the LLM insight generation pipeline.
-
-    Reads transcripts from Supabase that have no claims yet, runs LLM
-    extraction, matches/creates narratives, and persists all rows.
-    Safe for repeated / CRON invocations: existing claims for a
-    transcript are deleted before re-inserting (replace semantics).
-
-    Semantic matches attach claims to **existing** narrative rows without
-    rewriting those rows; extraction-only narrative metadata is consumed when
-    :func:`pipelines.narrative_matching.match_claim_to_narratives` creates a **new**
-    narrative.
-
-    Run locally:
-        conda activate yt-intel-project
-        python -m pipelines.llm_insight_generation
-
-    Returns
-    -------
-    dict with keys: video_ids, total_claims, total_new_narratives
-    """
+    """Run end-to-end claim extraction and narrative persistence."""
     sb = _get_supabase()
     prov = provider or _get_provider_from_env()
 

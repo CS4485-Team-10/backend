@@ -19,7 +19,7 @@ This repository contains:
 - **API**: FastAPI + Uvicorn
 - **DB/ORM & Migrations**: Supabase, SQLAlchemy 2.x, SQLModel, Alembic (`alembic/`)
 - **YouTube Data Ingestion**: YouTube Data API v3 + `youtube-transcript-api`
-- **LLM inference**: Ollama (OpenAI-compatible endpoint) with optional provider abstraction
+- **LLM inference**: Switchable Ollama/Bedrock provider abstraction (env-driven)
 - **Embeddings**: Google Gemini `embedContent` (remote HTTP)
 - **Tooling**: Ruff (format + lint), `python-dotenv`
 
@@ -67,8 +67,13 @@ Create a local `.env` (do not commit). This repo loads it via Pydantic settings 
 - **Common optional**
   - `FRONTEND_URL`, `PORT`, `ENV`
   - `LLM_PROVIDER` (default `ollama`), `LLM_MODEL`, `OLLAMA_BASE_URL`
-  - `YT_SEMANTIC_FILTER_MODEL`, `YT_QUOTA_DAILY_BUDGET_UNITS`
+  - `YT_QUOTA_DAILY_BUDGET_UNITS`
   - `NARR_EMBEDDING_TIMEOUT`, `NARR_STRONG_MATCH`, `NARR_MULTI_LINK`, `NARR_NEW_MIN`, `NARR_MAX_PER_CLAIM`
+
+Provider notes:
+
+- `pipelines/yt_data_ingestion.py` semantic filtering now uses `LLM_PROVIDER` + `LLM_MODEL` as its switch mechanism (`ollama` or `bedrock`), with ingestion default model `gemma2` when `LLM_MODEL` is unset.
+- `pipelines/llm_insight_generation.py` uses the same provider variables, with default model `qwen3` when `LLM_MODEL` is unset.
 
 Google Console:
 
@@ -111,6 +116,16 @@ python -m pipelines.yt_data_ingestion
 ```
 
 This pipeline searches YouTube, applies an LLM semantic filter (public-health relevance), filters by impact metrics, and persists `videos` + `transcripts` to Supabase.
+
+Example provider switching:
+
+```bash
+# local test
+LLM_PROVIDER=ollama LLM_MODEL=gemma2 python -m pipelines.yt_data_ingestion
+
+# cloud runtime
+LLM_PROVIDER=bedrock LLM_MODEL=gemma2 python -m pipelines.yt_data_ingestion
+```
 
 #### LLM insight generation (claims + narratives)
 
