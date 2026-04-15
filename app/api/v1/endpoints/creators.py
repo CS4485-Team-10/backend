@@ -24,7 +24,9 @@ def _fmt_reach(n: int) -> str:
 @router.get("/creators/risk")
 def list_creator_risk(
     narrative: Optional[str] = Query(None, description="Filter by narrative label"),
-    sort: str = Query("risk_desc", description="Sort order: risk_desc | risk_asc | reach_desc"),
+    sort: str = Query(
+        "risk_desc", description="Sort order: risk_desc | risk_asc | reach_desc"
+    ),
 ):
     """Creator Risk Monitor: per-channel risk data from claims + videos."""
     if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_ROLE_KEY:
@@ -32,13 +34,33 @@ def list_creator_risk(
 
     sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
 
-    videos = sb.table("videos").select("video_id, channel_id, channel_title, view_count").execute().data or []
-    claims = sb.table("claims").select("claim_id, video_id, fact_check_status, llm_confidence").execute().data or []
-    claim_narratives = sb.table("claim_narratives").select("claim_id, narrative_id").execute().data or []
-    narratives = sb.table("narratives").select("narrative_id, narrative_label").execute().data or []
+    videos = (
+        sb.table("videos")
+        .select("video_id, channel_id, channel_title, view_count")
+        .execute()
+        .data
+        or []
+    )
+    claims = (
+        sb.table("claims")
+        .select("claim_id, video_id, fact_check_status, llm_confidence")
+        .execute()
+        .data
+        or []
+    )
+    claim_narratives = (
+        sb.table("claim_narratives").select("claim_id, narrative_id").execute().data
+        or []
+    )
+    narratives = (
+        sb.table("narratives").select("narrative_id, narrative_label").execute().data
+        or []
+    )
 
     # Build narrative lookup: claim_id -> set of narrative labels
-    narr_by_id: dict[str, str] = {n["narrative_id"]: n["narrative_label"] for n in narratives}
+    narr_by_id: dict[str, str] = {
+        n["narrative_id"]: n["narrative_label"] for n in narratives
+    }
     claim_narr_labels: dict[str, set[str]] = defaultdict(set)
     for cn in claim_narratives:
         label = narr_by_id.get(cn["narrative_id"])
@@ -103,12 +125,14 @@ def list_creator_risk(
         else:
             risk_score = 0.0
 
-        results.append({
-            "handle": channel_handle.get(cid, cid),
-            "risk_score": risk_score,
-            "flagged_claims": channel_flagged.get(cid, 0),
-            "reach": _fmt_reach(channel_reach.get(cid, 0)),
-        })
+        results.append(
+            {
+                "handle": channel_handle.get(cid, cid),
+                "risk_score": risk_score,
+                "flagged_claims": channel_flagged.get(cid, 0),
+                "reach": _fmt_reach(channel_reach.get(cid, 0)),
+            }
+        )
 
     # Keep numeric reach for sorting; look up by handle
     handle_to_reach: dict[str, int] = {}

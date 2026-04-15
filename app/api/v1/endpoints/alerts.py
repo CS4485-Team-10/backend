@@ -81,7 +81,9 @@ def _time_window(earliest_iso: str | None) -> str:
 # ============================================================
 @router.get("/alerts")
 def list_alerts(
-    risk_level: Optional[str] = Query(None, description="Filter by risk level: High | Medium | Low"),
+    risk_level: Optional[str] = Query(
+        None, description="Filter by risk level: High | Medium | Low"
+    ),
 ):
     # --- Step 0: Make sure Supabase is configured ---
     if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_ROLE_KEY:
@@ -94,18 +96,35 @@ def list_alerts(
     # claim_narratives:  join table linking claims <-> narratives
     # claims:           individual health claims extracted from videos
     # videos:           YouTube videos with view counts
-    narratives = sb.table("narratives").select("narrative_id, narrative_label, narrative_description, narrative_risk_score, created_at").execute().data or []
-    claim_narrs = sb.table("claim_narratives").select("claim_id, narrative_id").execute().data or []
-    claims = sb.table("claims").select("claim_id, video_id, created_at").execute().data or []
+    narratives = (
+        sb.table("narratives")
+        .select(
+            "narrative_id, narrative_label, narrative_description, narrative_risk_score, created_at"
+        )
+        .execute()
+        .data
+        or []
+    )
+    claim_narrs = (
+        sb.table("claim_narratives").select("claim_id, narrative_id").execute().data
+        or []
+    )
+    claims = (
+        sb.table("claims").select("claim_id, video_id, created_at").execute().data or []
+    )
     videos = sb.table("videos").select("video_id, view_count").execute().data or []
 
     # --- Step 2: Build quick-lookup dicts so we don't loop repeatedly ---
     # video_id -> view count (e.g. "abc123" -> 46000)
-    view_map: dict[str, int] = {v["video_id"]: int(v.get("view_count") or 0) for v in videos}
+    view_map: dict[str, int] = {
+        v["video_id"]: int(v.get("view_count") or 0) for v in videos
+    }
     # claim_id -> which video it came from
     claim_video: dict[str, str] = {c["claim_id"]: c.get("video_id", "") for c in claims}
     # claim_id -> when the claim was created
-    claim_created: dict[str, str] = {c["claim_id"]: c.get("created_at", "") for c in claims}
+    claim_created: dict[str, str] = {
+        c["claim_id"]: c.get("created_at", "") for c in claims
+    }
 
     # --- Step 3: Group claims by narrative ---
     # narrative_id -> list of claim_ids linked to it
@@ -156,25 +175,27 @@ def list_alerts(
         total_views = sum(view_map.get(vid, 0) for vid in linked_videos)
 
         # Build the object exactly how the frontend expects it
-        results.append({
-            "id": nid,                                        # unique ID
-            "title": n.get("narrative_label") or "",          # e.g. "Ozempic Weight Loss"
-            "risk_level": level,                              # "High" / "Medium" / "Low"
-            "risk_score": round(score, 1),                    # 0.0 - 10.0
-            "videos_analyzed": len(linked_videos),            # count of unique videos
-            "total_views": _fmt_views(total_views),           # formatted like "15.3M"
-            "description": n.get("narrative_description") or "",
-            "time_window": _time_window(earliest_claim),      # e.g. "Last 90 days"
-        })
+        results.append(
+            {
+                "id": nid,  # unique ID
+                "title": n.get("narrative_label") or "",  # e.g. "Ozempic Weight Loss"
+                "risk_level": level,  # "High" / "Medium" / "Low"
+                "risk_score": round(score, 1),  # 0.0 - 10.0
+                "videos_analyzed": len(linked_videos),  # count of unique videos
+                "total_views": _fmt_views(total_views),  # formatted like "15.3M"
+                "description": n.get("narrative_description") or "",
+                "time_window": _time_window(earliest_claim),  # e.g. "Last 90 days"
+            }
+        )
 
     # --- Step 5: Sort by risk score (highest first) and return ---
     results.sort(key=lambda r: -r["risk_score"])
 
     return {
         "ok": True,
-        "data": results,              # the array of narrative alerts
-        "count": len(results),        # how many after filtering
-        "high_count": high_count,     # for the "High Risk: X" summary card
-        "medium_count": medium_count, # for the "Medium Risk: X" summary card
-        "low_count": low_count,       # for the "Low Risk: X" summary card
+        "data": results,  # the array of narrative alerts
+        "count": len(results),  # how many after filtering
+        "high_count": high_count,  # for the "High Risk: X" summary card
+        "medium_count": medium_count,  # for the "Medium Risk: X" summary card
+        "low_count": low_count,  # for the "Low Risk: X" summary card
     }
