@@ -1,7 +1,40 @@
-from pydantic_settings import BaseSettings
+from urllib.parse import quote, urlparse, urlunparse
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _encode_password_in_url(url: str) -> str:
+    """URL-encode password to avoid special chars (e.g. !) breaking psycopg2."""
+    if not url:
+        return url
+    try:
+        p = urlparse(url)
+        if not p.password:
+            return url
+        encoded = quote(p.password, safe="")
+        if encoded == p.password:
+            return url
+        netloc = f"{p.username}:{encoded}@{p.hostname}"
+        if p.port:
+            netloc += f":{p.port}"
+        return urlunparse(
+            (
+                p.scheme,
+                netloc,
+                p.path or "/",
+                p.params or "",
+                p.query or "",
+                p.fragment or "",
+            )
+        )
+    except Exception:
+        return url
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
     ENV: str = "dev"
     PORT: int = 8000
     FRONTEND_URL: str = "http://localhost:3000"
@@ -12,15 +45,20 @@ class Settings(BaseSettings):
     DATABASE_URL: str = ""
 
     YOUTUBE_API_KEY: str = ""
-    # DS notebook uses YOUTUBE_DATA_API_KEY; either key can be used for ingestion
     YOUTUBE_DATA_API_KEY: str = ""
+    YOUTUBE_SEARCH_QUERY: str = ""
+
+    LLM_PROVIDER: str = ""
+    LLM_MODEL: str = ""
 
     @property
     def youtube_api_key(self) -> str:
         return self.YOUTUBE_API_KEY or self.YOUTUBE_DATA_API_KEY
 
-    class Config:
-        env_file = ".env"
+    @field_validator("DATABASE_URL", mode="after")
+    @classmethod
+    def encode_database_url_password(cls, v: str) -> str:
+        return _encode_password_in_url(v)
 
 
 settings = Settings()
