@@ -510,16 +510,33 @@ def _calculate_claim_risk_level(
     entailment_label: str,
     entailment_confidence: float,
 ) -> str:
+    """
+    Calculate risk level based on fact-check results and entailment analysis.
+
+    Strategy:
+    - HIGH: Verified false by fact-checkers OR strongly contradicts medical consensus
+    - MEDIUM: Contradicts medical consensus (lower confidence)
+    - LOW: Aligned with or neutral to medical consensus (default safe state)
+
+    Note: Claims without fact-check results (pending/unverifiable) default to LOW
+    if they don't contradict medical science, rather than assuming medium risk.
+    """
+    # HIGH RISK: Verified false by fact-checkers
     if fact_check_status == "verified_false":
         return "high"
+
+    # HIGH RISK: High-confidence contradiction of medical consensus
     if entailment_label == "refuted" and entailment_confidence >= 0.75:
         return "high"
-    if (
-        fact_check_status in {"unverifiable", "pending"}
-        or fact_check_confidence == "low"
-        or entailment_label == "refuted"
-    ):
+
+    # MEDIUM RISK: Contradicts medical consensus (lower confidence)
+    if entailment_label == "refuted":
         return "medium"
+
+    # LOW RISK: Supported or neutral claims (default safe state)
+    # Even if fact_check_status is "pending"/"unverifiable", if the entailment
+    # check says it's aligned with science ("supported") or is neutral opinion,
+    # it's low risk by default.
     return "low"
 
 
