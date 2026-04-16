@@ -648,11 +648,11 @@ def ids_from_supabase_without_factcheck() -> list[str]:
     than ids_from_supabase_with_incomplete_claims() which checks all fields.
     """
     client = get_supabase_client()
-    
+
     # Get all videos that have claims
     all_claims = client.table(SUPABASE_TABLE_CLAIMS).select("video_id").execute()
     videos_with_claims = set(r["video_id"] for r in all_claims.data)
-    
+
     # Get videos where claims have been fact-checked (fact_check_status is NOT NULL)
     checked_claims = (
         client.table(SUPABASE_TABLE_CLAIMS)
@@ -661,7 +661,7 @@ def ids_from_supabase_without_factcheck() -> list[str]:
         .execute()
     )
     videos_already_checked = set(r["video_id"] for r in checked_claims.data)
-    
+
     # Videos needing fact-check = have claims but none are checked
     remaining = sorted(list(videos_with_claims - videos_already_checked))
     print(
