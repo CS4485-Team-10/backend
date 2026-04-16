@@ -679,8 +679,12 @@ def push_misinfo_to_supabase(report: VideoMisinfoReport):
     if report.error:
         return
 
-    print(f"    [INFO] Video {report.video_id} analyzed (use mode 4 to update claims table)")
-    print(f"    Risk: {report.risk_level.upper()}, Claims: {len(report.claims_analyzed)}, Patterns: {len(report.pattern_matches)}")
+    print(
+        f"    [INFO] Video {report.video_id} analyzed (use mode 4 to update claims table)"
+    )
+    print(
+        f"    Risk: {report.risk_level.upper()}, Claims: {len(report.claims_analyzed)}, Patterns: {len(report.pattern_matches)}"
+    )
 
 
 RISK_ICONS = {"low": "[LOW]", "medium": "[MED]", "high": "[HIGH]"}
