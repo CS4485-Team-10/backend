@@ -1,5 +1,6 @@
 from pipelines.sentiment_analysis import analyze_video_sentiment
 
+
 def lambda_handler(event, context):
     video_id = event.get("video_id")
     if not video_id:

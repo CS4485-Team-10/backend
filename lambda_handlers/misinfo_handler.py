@@ -1,6 +1,7 @@
 from dataclasses import asdict, is_dataclass
 from pipelines.misinfo_checker import check_video
 
+
 def lambda_handler(event, context):
     video_id = event.get("video_id")
     if not video_id:
