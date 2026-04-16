@@ -658,5 +658,44 @@ def run_youtube_data_ingestion_pipeline(
     }
 
 
+def handler(event, context):
+    """
+    AWS Lambda entrypoint for YouTube data ingestion.
+
+    `event` may optionally provide a subset of the run_youtube_data_ingestion_pipeline
+    keyword arguments; any missing keys fall back to existing defaults.
+    """
+    del context  # unused
+
+    event = event or {}
+    if not isinstance(event, dict):
+        raise TypeError("event must be a dict or None")
+
+    kwargs = {}
+    if "search_queries" in event:
+        kwargs["search_queries"] = event["search_queries"]
+    if "max_search_pages" in event:
+        kwargs["max_search_pages"] = int(event["max_search_pages"])
+    if "min_comments_per_1k" in event:
+        kwargs["min_comments_per_1k"] = float(event["min_comments_per_1k"])
+    if "min_likes_per_1k" in event:
+        kwargs["min_likes_per_1k"] = float(event["min_likes_per_1k"])
+    if "min_views" in event:
+        kwargs["min_views"] = int(event["min_views"])
+    if "min_like_count" in event:
+        kwargs["min_like_count"] = int(event["min_like_count"])
+    if "min_comment_count" in event:
+        kwargs["min_comment_count"] = int(event["min_comment_count"])
+    if "percentile" in event:
+        kwargs["percentile"] = float(event["percentile"])
+    if "quota_budget" in event:
+        kwargs["quota_budget"] = int(event["quota_budget"])
+    if "verbose" in event:
+        kwargs["verbose"] = bool(event["verbose"])
+
+    result = run_youtube_data_ingestion_pipeline(**kwargs)
+    return {"ok": True, **result}
+
+
 if __name__ == "__main__":
     run_youtube_data_ingestion_pipeline()

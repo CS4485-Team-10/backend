@@ -688,6 +688,143 @@ def print_report(report: VideoMisinfoReport):
     print()
 
 
+def run_misinfo_videos_pipeline(
+    video_ids: list[str],
+    *,
+    write_json: bool = False,
+    json_path: str = "misinfo_report.json",
+) -> dict:
+    """Run misinformation checks for a list of video IDs."""
+    if not video_ids:
+        print("No videos to check.")
+        return {
+            "ok": True,
+            "video_ids": [],
+            "total": 0,
+            "checked": 0,
+            "failed": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+            "total_patterns": 0,
+            "total_claims": 0,
+            "saved_json": False,
+            "json_path": None,
+            "reports": [],
+        }
+
+    print(f"Checking {len(video_ids)} video(s) for misinformation...\n")
+
+    all_reports: list[VideoMisinfoReport] = []
+    for i, vid in enumerate(video_ids, 1):
+        print(f"[{i}/{len(video_ids)}] {vid}")
+        report = check_video(vid)
+        print_report(report)
+        all_reports.append(report)
+
+    checked = [r for r in all_reports if r.error is None]
+    failed = len(all_reports) - len(checked)
+    high = sum(1 for r in checked if r.risk_level == "high")
+    medium = sum(1 for r in checked if r.risk_level == "medium")
+    low = sum(1 for r in checked if r.risk_level == "low")
+    total_patterns = sum(len(r.pattern_matches) for r in checked)
+    total_claims = sum(len(r.claims_analyzed) for r in checked)
+
+    print(f"{'=' * 60}")
+    print("MISINFORMATION CHECK SUMMARY")
+    print(f"{'-' * 60}")
+    print(
+        f"  Videos checked:     {len(checked)}/{len(all_reports)}  (failed: {failed})"
+    )
+    print(
+        f"  Risk breakdown:     [HIGH] {high} high  |  [MED] {medium} medium  |  [LOW] {low} low"
+    )
+    print(f"  Pattern flags:      {total_patterns} total across all videos")
+    print(f"  Claims analyzed:    {total_claims} total")
+    if high > 0:
+        print(f"\n  [!] {high} video(s) flagged HIGH RISK -- review recommended")
+    print(f"{'=' * 60}")
+
+    saved_json = False
+    if write_json:
+        output = [asdict(r) for r in all_reports]
+        path = Path(json_path)
+        path.write_text(json.dumps(output, indent=2, default=str))
+        print(f"\nFull report saved to {path}")
+        saved_json = True
+
+    return {
+        "ok": True,
+        "video_ids": [r.video_id for r in all_reports],
+        "total": len(all_reports),
+        "checked": len(checked),
+        "failed": failed,
+        "high": high,
+        "medium": medium,
+        "low": low,
+        "total_patterns": total_patterns,
+        "total_claims": total_claims,
+        "saved_json": saved_json,
+        "json_path": json_path if saved_json else None,
+        "reports": [asdict(r) for r in all_reports],
+    }
+
+
+def handler(event, context):
+    """
+    AWS Lambda entrypoint for misinformation checks.
+
+    `event` may provide:
+      - action: "videos" (default) or "claims_batch"
+      - video_ids: explicit list of IDs (for action == "videos")
+      - mode: None | "1" | "2" | "3" (mirrors CLI modes) for videos
+      - ids_file: path used with mode "1"
+      - write_json: bool
+      - json_path: output path for JSON
+      - batch_size: int (for action == "claims_batch")
+    """
+    del context  # unused
+
+    event = event or {}
+    if not isinstance(event, dict):
+        raise TypeError("event must be a dict or None")
+
+    action = event.get("action", "videos")
+
+    if action == "claims_batch":
+        batch_size = int(event.get("batch_size", 50))
+        process_claims_table(batch_size=batch_size)
+        return {"ok": True, "action": "claims_batch", "batch_size": batch_size}
+
+    write_json = bool(event.get("write_json", False))
+    json_path = event.get("json_path", "misinfo_report.json")
+
+    if "video_ids" in event and event["video_ids"]:
+        video_ids = list(event["video_ids"])
+    else:
+        mode = event.get("mode")
+
+        if mode is None:
+            video_ids = ["dQw4w9WgXcQ", "T9itjMTqQ8Q"]
+        elif mode == "1":
+            ids_file = event.get("ids_file")
+            if not ids_file:
+                raise ValueError("ids_file is required when mode == '1'")
+            video_ids = ids_from_file(ids_file)
+        elif mode == "2":
+            video_ids = ids_from_supabase()
+        elif mode == "3":
+            video_ids = ids_from_supabase_with_incomplete_claims()
+        else:
+            raise ValueError(
+                f"Unknown mode '{mode}'. Use: None | '1' with ids_file | '2' | '3'"
+            )
+
+    return run_misinfo_videos_pipeline(
+        video_ids, write_json=write_json, json_path=json_path
+    )
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "4":
         batch = 50
@@ -697,6 +834,8 @@ if __name__ == "__main__":
                 batch = int(sys.argv[idx + 1])
         process_claims_table(batch_size=batch)
         sys.exit(0)
+
+    write_json = "--json" in sys.argv
 
     if "--video" in sys.argv:
         idx = sys.argv.index("--video")
@@ -724,44 +863,6 @@ if __name__ == "__main__":
             )
             sys.exit(1)
 
-    if not video_ids:
-        print("No videos to check.")
-        sys.exit(0)
-
-    print(f"Checking {len(video_ids)} video(s) for misinformation...\n")
-
-    all_reports = []
-    for i, vid in enumerate(video_ids, 1):
-        print(f"[{i}/{len(video_ids)}] {vid}")
-        report = check_video(vid)
-        print_report(report)
-        all_reports.append(report)
-    checked = [r for r in all_reports if r.error is None]
-    failed = len(all_reports) - len(checked)
-    high = sum(1 for r in checked if r.risk_level == "high")
-    medium = sum(1 for r in checked if r.risk_level == "medium")
-    low = sum(1 for r in checked if r.risk_level == "low")
-    total_patterns = sum(len(r.pattern_matches) for r in checked)
-    total_claims = sum(len(r.claims_analyzed) for r in checked)
-
-    print(f"{'=' * 60}")
-    print("MISINFORMATION CHECK SUMMARY")
-    print(f"{'-' * 60}")
-    print(
-        f"  Videos checked:     {len(checked)}/{len(all_reports)}  (failed: {failed})"
+    run_misinfo_videos_pipeline(
+        video_ids, write_json=write_json, json_path="misinfo_report.json"
     )
-    print(
-        f"  Risk breakdown:     [HIGH] {high} high  |  [MED] {medium} medium  |  [LOW] {low} low"
-    )
-    print(f"  Pattern flags:      {total_patterns} total across all videos")
-    print(f"  Claims analyzed:    {total_claims} total")
-    if high > 0:
-        print(f"\n  [!] {high} video(s) flagged HIGH RISK -- review recommended")
-    print(f"{'=' * 60}")
-
-    # Optionally dump full JSON
-    if "--json" in sys.argv:
-        output = [asdict(r) for r in all_reports]
-        json_path = Path("misinfo_report.json")
-        json_path.write_text(json.dumps(output, indent=2, default=str))
-        print(f"\nFull report saved to {json_path}")

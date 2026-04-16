@@ -168,6 +168,123 @@ def save_sentiment_to_json(
     )
 
 
+def run_sentiment_pipeline(
+    video_ids: list[str],
+    *,
+    save_json: bool = False,
+    output_file: str = "video_sentiment_results.json",
+) -> dict:
+    """Run sentiment analysis over a list of video IDs."""
+    if not video_ids:
+        return {
+            "ok": True,
+            "video_ids": [],
+            "total": 0,
+            "analyzed": 0,
+            "failed": 0,
+            "average_sentiment": None,
+            "saved_json": False,
+            "output_file": None,
+        }
+
+    print(
+        f"Analyzing {len(video_ids)} video(s) for VIDEO-LEVEL sentiment...  (save_json={save_json})\n"
+    )
+
+    all_results: list[dict] = []
+    for vid in video_ids:
+        print(f"[{vid}]")
+        result = analyze_video_sentiment(vid)
+        print_result(result)
+        all_results.append(result)
+
+    successes = [r for r in all_results if "error" not in r]
+    failures = len(all_results) - len(successes)
+    avg_sentiment = None
+
+    if successes:
+        avg_sentiment = sum(r["sentiment_score"] for r in successes) / len(successes)
+        print(f"\n{'-' * 50}")
+        print(
+            f"Total: {len(all_results)} videos  |  Analyzed: {len(successes)}  |  Failed: {failures}"
+        )
+        print(f"Average sentiment score: {avg_sentiment:+.4f}")
+
+        if save_json:
+            save_sentiment_to_json(all_results, output_file)
+    else:
+        print(f"\nNo videos could be analyzed ({failures} failed).")
+
+    return {
+        "ok": True,
+        "video_ids": [r.get("video_id") for r in all_results if "video_id" in r],
+        "total": len(all_results),
+        "analyzed": len(successes),
+        "failed": failures,
+        "average_sentiment": avg_sentiment,
+        "saved_json": bool(save_json and successes),
+        "output_file": output_file if save_json and successes else None,
+        "results": all_results,
+    }
+
+
+def handler(event, context):
+    """
+    AWS Lambda entrypoint for sentiment analysis.
+
+    `event` may provide:
+      - video_ids: explicit list of IDs
+      - mode: None | "1" | "2" (mirrors CLI modes)
+      - ids_file: path used with mode "1"
+      - save_json: bool
+      - output_file: JSON output path
+    """
+    del context  # unused
+
+    event = event or {}
+    if not isinstance(event, dict):
+        raise TypeError("event must be a dict or None")
+
+    save_json = bool(event.get("save_json", False))
+    output_file = event.get("output_file", "video_sentiment_results.json")
+
+    if "video_ids" in event and event["video_ids"]:
+        video_ids = list(event["video_ids"])
+    else:
+        mode = event.get("mode")
+        if mode is None:
+            video_ids = ["dQw4w9WgXcQ"]
+        elif mode == "1":
+            ids_file = event.get("ids_file")
+            if not ids_file:
+                raise ValueError("ids_file is required when mode == '1'")
+            video_ids = ids_from_file(ids_file)
+        elif mode == "2":
+            video_ids = ids_from_supabase_all_videos()
+            save_json = True if "save_json" not in event else save_json
+        else:
+            raise ValueError(
+                f"Unknown mode '{mode}'. Use: None | '1' with ids_file | '2'"
+            )
+
+    if not video_ids:
+        return {
+            "ok": True,
+            "video_ids": [],
+            "total": 0,
+            "analyzed": 0,
+            "failed": 0,
+            "average_sentiment": None,
+            "saved_json": False,
+            "output_file": None,
+            "results": [],
+        }
+
+    return run_sentiment_pipeline(
+        video_ids, save_json=save_json, output_file=output_file
+    )
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else None
     save_json = "--save" in sys.argv
@@ -191,28 +308,4 @@ if __name__ == "__main__":
         print("No videos to analyze.")
         sys.exit(0)
 
-    print(
-        f"Analyzing {len(video_ids)} video(s) for VIDEO-LEVEL sentiment...  (save_json={save_json})\n"
-    )
-
-    all_results = []
-    for vid in video_ids:
-        print(f"[{vid}]")
-        result = analyze_video_sentiment(vid)
-        print_result(result)
-        all_results.append(result)
-
-    successes = [r for r in all_results if "error" not in r]
-    failures = len(all_results) - len(successes)
-    if successes:
-        avg = sum(r["sentiment_score"] for r in successes) / len(successes)
-        print(f"\n{'-' * 50}")
-        print(
-            f"Total: {len(all_results)} videos  |  Analyzed: {len(successes)}  |  Failed: {failures}"
-        )
-        print(f"Average sentiment score: {avg:+.4f}")
-
-        if save_json:
-            save_sentiment_to_json(all_results, output_file)
-    else:
-        print(f"\nNo videos could be analyzed ({failures} failed).")
+    run_sentiment_pipeline(video_ids, save_json=save_json, output_file=output_file)
