@@ -1,0 +1,6 @@
+python-dotenv
+youtube-transcript-api
+supabase
+transformers
+torch
+requests

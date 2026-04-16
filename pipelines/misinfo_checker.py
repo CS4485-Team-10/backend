@@ -38,7 +38,7 @@ GOOGLE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 SUPABASE_TABLE_VIDEOS = "videos"
-SUPABASE_TABLE_INSIGHTS = "insights"
+SUPABASE_TABLE_CLAIMS = "claims"
 
 FACT_CHECK_API_URL = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
 
@@ -645,92 +645,42 @@ def ids_from_supabase() -> list[str]:
 
 def ids_from_supabase_without_misinfo() -> list[str]:
     """
-    Pull video IDs from Supabase that do NOT already have a
-    misinfo check row in the insights table (model = 'misinfo').
+    Pull video IDs from Supabase that have claims but those claims
+    haven't been fact-checked yet (fact_check_status is NULL).
     """
     client = get_supabase_client()
 
-    # All video IDs
-    all_videos = client.table(SUPABASE_TABLE_VIDEOS).select("video_id").execute()
-    all_ids = {r["video_id"] for r in all_videos.data}
+    # Get all videos that have claims
+    all_claims = client.table(SUPABASE_TABLE_CLAIMS).select("video_id").execute()
+    videos_with_claims = set(r["video_id"] for r in all_claims.data)
 
-    # Already checked
-    existing = (
-        client.table(SUPABASE_TABLE_INSIGHTS)
+    # Get videos where claims have been fact-checked (fact_check_status is NOT NULL)
+    checked_claims = (
+        client.table(SUPABASE_TABLE_CLAIMS)
         .select("video_id")
-        .eq("model", "misinfo")
+        .not_.is_("fact_check_status", "null")
         .execute()
     )
-    done_ids = {r["video_id"] for r in existing.data}
+    videos_already_checked = set(r["video_id"] for r in checked_claims.data)
 
-    remaining = list(all_ids - done_ids)
+    # Videos needing fact-check = have claims but none are checked
+    remaining = list(videos_with_claims - videos_already_checked)
     print(
-        f"  {len(all_ids)} total videos, {len(done_ids)} already checked, {len(remaining)} remaining"
+        f"  {len(videos_with_claims)} videos with claims, {len(videos_already_checked)} already fact-checked, {len(remaining)} remaining"
     )
     return remaining
 
 
 def push_misinfo_to_supabase(report: VideoMisinfoReport):
+    """
+    NOTE: Without insights table, this just prints a summary.
+    Use mode 4 to enrich individual claims in the claims table.
+    """
     if report.error:
         return
 
-    client = get_supabase_client()
-
-    claims_data = []
-    for c in report.claims_analyzed:
-        claims_data.append(
-            {
-                "claim_text": c.claim_text,
-                "claim_type": c.claim_type,
-                "claim_type_confidence": c.claim_type_confidence,
-                "entailment_label": c.entailment_label,
-                "entailment_confidence": c.entailment_confidence,
-                "fact_checks": [
-                    {
-                        "claim_text": fc.claim_text,
-                        "claimant": fc.claimant,
-                        "rating": fc.rating,
-                        "publisher": fc.publisher,
-                        "url": fc.url,
-                    }
-                    for fc in c.fact_checks
-                ],
-            }
-        )
-
-    # pattern matches found
-    narratives_data = [
-        {
-            "pattern": m.pattern_description,
-            "severity": m.severity,
-            "match_count": m.match_count,
-        }
-        for m in report.pattern_matches
-    ]
-
-    labels_data = {
-        "risk_level": report.risk_level,
-        "risk_reasons": report.risk_reasons,
-        "high_severity_count": report.high_severity_count,
-        "medium_severity_count": report.medium_severity_count,
-        "transcript_length_words": report.transcript_length_words,
-    }
-
-    # low risk = high confidence the video is clean, high risk = low confidence
-    confidence_map = {"low": 0.9, "medium": 0.6, "high": 0.3}
-    confidence = confidence_map.get(report.risk_level, 0.5)
-
-    row = {
-        "video_id": report.video_id,
-        "model": "misinfo",
-        "claims": json.dumps(claims_data),
-        "narratives": json.dumps(narratives_data),
-        "labels": json.dumps(labels_data),
-        "confidence": confidence,
-    }
-
-    client.table(SUPABASE_TABLE_INSIGHTS).insert(row).execute()
-    print(f"    [OK] Pushed misinfo report for {report.video_id} to Supabase")
+    print(f"    [INFO] Video {report.video_id} analyzed (use mode 4 to update claims table)")
+    print(f"    Risk: {report.risk_level.upper()}, Claims: {len(report.claims_analyzed)}, Patterns: {len(report.pattern_matches)}")
 
 
 RISK_ICONS = {"low": "[LOW]", "medium": "[MED]", "high": "[HIGH]"}
@@ -816,7 +766,7 @@ if __name__ == "__main__":
             video_ids = ids_from_supabase()
         elif mode == "3":
             video_ids = ids_from_supabase_without_misinfo()
-            push_to_db = True  # auto-push when pulling unchecked from supabase
+            push_to_db = False  # mode 3 just analyzes; use mode 4 to update claims
         else:
             print(
                 f"Unknown mode '{mode}'. Use: no args | 1 <file> | 2 | 3 | --video <ID>"
