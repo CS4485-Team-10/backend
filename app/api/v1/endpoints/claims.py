@@ -1,7 +1,5 @@
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlmodel import Session, select, func, col
+from sqlmodel import Session, col, func, select
 
 from app.core.database import get_session
 from app.models.claim import Claim
@@ -11,7 +9,7 @@ from app.schemas.claim import ClaimListResponse, ClaimResponse, ClaimStatsRespon
 router = APIRouter()
 
 
-def _format_views(total: Optional[int]) -> str:
+def _format_views(total: int | None) -> str:
     if total is None or total == 0:
         return "0"
     if total >= 1_000_000:
@@ -39,8 +37,8 @@ def _claim_confidence_display(claim: Claim) -> str:
 
 def _build_claim_response(
     claim: Claim,
-    channel_title: Optional[str],
-    view_count: Optional[int],
+    channel_title: str | None,
+    view_count: int | None,
 ) -> ClaimResponse:
     return ClaimResponse(
         claim_id=str(claim.claim_id)[:8].upper(),
@@ -55,8 +53,8 @@ def _build_claim_response(
 
 @router.get("/claims", response_model=ClaimListResponse)
 def list_claims(
-    search: Optional[str] = Query(None),
-    status: Optional[str] = Query(None),
+    search: str | None = Query(None),
+    status: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     session: Session = Depends(get_session),
@@ -83,7 +81,13 @@ def list_claims(
             )
         )
 
-    # TODO: filter by status once claims.verification_status column exists
+    if status:
+        statement = statement.where(col(Claim.fact_check_status).ilike(status))
+        count_stmt = (
+            select(func.count())
+            .select_from(Claim)
+            .where(col(Claim.fact_check_status).ilike(status))
+        )
 
     total = session.exec(count_stmt).one()
 
@@ -95,12 +99,23 @@ def list_claims(
         for claim, channel_title, view_count in rows
     ]
 
-    # TODO: compute real counts once claims.verification_status column exists
+    verified = session.exec(
+        select(func.count())
+        .select_from(Claim)
+        .where(col(Claim.fact_check_status).ilike("verified"))
+    ).one()
+    disputed = session.exec(
+        select(func.count())
+        .select_from(Claim)
+        .where(col(Claim.fact_check_status).ilike("disputed"))
+    ).one()
+    under_review = total - verified - disputed
+
     stats = ClaimStatsResponse(
         total=total,
-        verified=0,
-        disputed=0,
-        under_review=total,
+        verified=verified,
+        disputed=disputed,
+        under_review=under_review,
     )
 
     return ClaimListResponse(data=data, stats=stats, count=total)
