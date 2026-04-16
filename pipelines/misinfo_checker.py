@@ -1,16 +1,4 @@
-# misinfo_checker.py
-# pulls transcripts from youtube videos and checks them for health misinformation
-# three approaches: regex pattern matching, google fact check api, and NLI entailment
-#
-# modes:
-#   python misinfo_checker.py                 -> test on a default video
-#   python misinfo_checker.py 1 ids.txt       -> from a file
-#   python misinfo_checker.py 2               -> all videos from supabase
-#   python misinfo_checker.py 3               -> only unchecked videos, auto-push to db
-#   python misinfo_checker.py 4               -> fill NULL fields in the claims table
-#   python misinfo_checker.py --video <ID>    -> single video by id
-
-# Suppress noisy model output first (before any transformers imports)
+# Misinformation checks for YouTube transcripts.
 import os
 import sys
 
@@ -38,21 +26,16 @@ GOOGLE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 SUPABASE_TABLE_VIDEOS = "videos"
-SUPABASE_TABLE_INSIGHTS = "insights"
 
 FACT_CHECK_API_URL = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
 
-# zero-shot NLI -- handles claim extraction, stance, entailment
 nli_model = pipeline(  # type: ignore[call-overload]
     "zero-shot-classification",
     model="facebook/bart-large-mnli",
 )
 
-# Transcript client
 ytt_api = YouTubeTranscriptApi()
 
-# regex patterns for known health misinfo. each is (pattern, description, severity)
-# severity: high = well-documented false claim, medium = suspicious but not definitive
 MISINFO_PATTERNS = [
     # Vaccines
     (r"vaccines?\s+caus(e|es|ed|ing)\s+autism", "Vaccines cause autism", "high"),
@@ -155,12 +138,10 @@ MISINFO_PATTERNS = [
     ),
 ]
 
-# Compile patterns once
 COMPILED_PATTERNS = [
     (re.compile(p, re.IGNORECASE), desc, sev) for p, desc, sev in MISINFO_PATTERNS
 ]
 
-# labels for zero-shot claim classification
 HEALTH_CLAIM_TYPES = [
     "a specific health treatment or cure",
     "a claim about vaccine safety or efficacy",
@@ -171,8 +152,6 @@ HEALTH_CLAIM_TYPES = [
     "a claim about government or institutional health policy",
     "general health education or information",
 ]
-
-# data classes
 
 
 @dataclass
@@ -206,22 +185,16 @@ class VideoMisinfoReport:
     video_id: str
     error: str | None = None
     transcript_length_words: int = 0
-    # Pattern-based detection
     pattern_matches: list[PatternMatch] = field(default_factory=list)
     high_severity_count: int = 0
     medium_severity_count: int = 0
-    # Claim-level analysis
     claims_analyzed: list[ClaimAnalysis] = field(default_factory=list)
-    # Overall assessment
-    risk_level: str = "low"  # low / medium / high
+    risk_level: str = "low"
     risk_reasons: list[str] = field(default_factory=list)
 
 
 def fetch_transcript(video_id: str) -> str | None:
-    # First try to get transcript from Supabase, fall back to YouTube if not found
-    # returns None if no transcript at all
     try:
-        # Try Supabase first
         client = get_supabase_client()
         result = (
             client.table("transcripts")
@@ -232,16 +205,13 @@ def fetch_transcript(video_id: str) -> str | None:
 
         if result.data and len(result.data) > 0:
             text = result.data[0]["cleaned_transcript_txt"]
-            # Already cleaned, just return
         else:
-            # Fall back to YouTube API
             try:
                 transcript = ytt_api.fetch(video_id, languages=["en"])
             except Exception:
                 transcript = ytt_api.fetch(video_id)
 
             text = " ".join(s.text for s in transcript.snippets)
-        # Clean
         text = re.sub(r"\[[^\]]*\]", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\([^)]*\)", "", text)
         text = re.sub(r"\b(?:um|uh|ugh|hmm)\b", "", text, flags=re.IGNORECASE)
@@ -252,12 +222,10 @@ def fetch_transcript(video_id: str) -> str | None:
 
 
 def extract_sentences(text: str) -> list[str]:
-    # splits on sentence endings and filters to reasonable lengths (5-60 words)
     raw = re.split(r"(?<=[.!?])\s+", text)
     sentences = []
     for s in raw:
         s = s.strip()
-        # Only keep sentences of reasonable length (5-60 words)
         word_count = len(s.split())
         if 5 <= word_count <= 60:
             sentences.append(s)
@@ -280,8 +248,6 @@ def scan_patterns(text: str) -> list[PatternMatch]:
 
 
 def search_fact_checks(query: str, max_results: int = 3) -> list[FactCheckResult]:
-    # hits the Google Fact Check Tools API -- free tier, just needs an api key
-    # returns up to max_results ratings from real fact-check publishers
     if not GOOGLE_API_KEY:
         return []
 
@@ -290,7 +256,7 @@ def search_fact_checks(query: str, max_results: int = 3) -> list[FactCheckResult
             FACT_CHECK_API_URL,
             params={
                 "key": GOOGLE_API_KEY,
-                "query": query[:200],  # API has length limits
+                "query": query[:200],
                 "languageCode": "en",
             },
             timeout=10,
@@ -322,8 +288,6 @@ def classify_claim_type(sentence: str) -> tuple[str, float]:
 
 
 def check_entailment(claim: str, evidence: str | None = None) -> tuple[str, float]:
-    # frames the claim against 3 consensus hypotheses and picks the best match
-    # returns (supported/refuted/neutral, confidence)
     consensus_hypotheses = [
         "This claim is consistent with established medical science.",
         "This claim contradicts established medical science.",
@@ -340,7 +304,6 @@ def check_entailment(claim: str, evidence: str | None = None) -> tuple[str, floa
 
 
 def is_health_claim(sentence: str) -> bool:
-    # quick filter so we don't run the full NLI pipeline on filler text
     result = nli_model(
         sentence,
         candidate_labels=[
@@ -357,7 +320,6 @@ def is_health_claim(sentence: str) -> bool:
 def analyze_claims(text: str, max_claims: int = 10) -> list[ClaimAnalysis]:
     sentences = extract_sentences(text)
 
-    # check more sentences than we need so we have room to filter
     claim_sentences = []
     for s in sentences:
         if len(claim_sentences) >= max_claims * 3:
@@ -370,14 +332,12 @@ def analyze_claims(text: str, max_claims: int = 10) -> list[ClaimAnalysis]:
         claim_type, type_conf = classify_claim_type(sentence)
         entailment, ent_conf = check_entailment(sentence)
 
-        # Skip boring "general education" claims that are clearly fine
         if (
             claim_type == "general health education or information"
             and entailment == "supported"
         ):
             continue
 
-        # Search Google Fact Check API for this claim
         fact_checks = search_fact_checks(sentence)
 
         analyses.append(
@@ -414,7 +374,6 @@ def check_video(video_id: str) -> VideoMisinfoReport:
 
     report.claims_analyzed = analyze_claims(text)
 
-    # figure out overall risk
     refuted_claims = sum(
         1 for c in report.claims_analyzed if c.entailment_label == "refuted"
     )
@@ -476,7 +435,6 @@ def get_supabase_client():
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# lazy load so we don't pull in a second model unless process_claims_table() is actually called
 _claim_sentiment_pipeline = None
 
 
@@ -493,9 +451,8 @@ def _get_claim_sentiment_pipeline():
 
 
 def _run_claim_sentiment(claim_text: str) -> tuple[str, float]:
-    # same gradient approach as transcript sentiment: POS - NEG => -1.0 to +1.0
     pipe = _get_claim_sentiment_pipeline()
-    result = pipe(claim_text[:512])[0]  # list of 3 dicts
+    result = pipe(claim_text[:512])[0]
     scores = {r["label"].lower(): r["score"] for r in result}
     gradient = round(scores.get("positive", 0.0) - scores.get("negative", 0.0), 4)
     if gradient > 0.1:
@@ -508,8 +465,6 @@ def _run_claim_sentiment(claim_text: str) -> tuple[str, float]:
 
 
 def _run_fact_check_status(claim_text: str) -> str:
-    # returns the verdict from google fact check, or 'pending' if nothing found
-    # Returns: 'pending', 'verified_true', 'verified_false', 'unverifiable'
     results = search_fact_checks(claim_text, max_results=3)
     if not results:
         return "pending"
@@ -535,55 +490,53 @@ def _run_fact_check_status(claim_text: str) -> str:
         if any(w in rating for w in UNVERIFIABLE_WORDS):
             return "unverifiable"
 
-    # If we got results but couldn't categorize them, mark as unverifiable
     return "unverifiable"
-
-
-def _misinfo_label_from_entailment(claim_text: str) -> str:
-    # uses NLI entailment as a fallback when the fact check api has no results
-    entailment, confidence = check_entailment(claim_text)
-    if entailment == "refuted" and confidence >= 0.6:
-        return "misinfo"
-    elif entailment == "supported" and confidence >= 0.6:
-        return "clean"
-    return "uncertain"
 
 
 def _calculate_fact_check_confidence(
     entailment_confidence: float, has_fact_checks: bool
 ) -> str:
-    """
-    Calculate fact check confidence level based on NLI confidence and fact check availability.
-    Returns: 'high', 'medium', or 'low'
-    """
-    # High confidence: strong NLI confidence (>= 0.75) AND external fact checks found
     if entailment_confidence >= 0.75 and has_fact_checks:
         return "high"
-
-    # Medium confidence: decent NLI confidence (>= 0.5) OR has fact checks
     if entailment_confidence >= 0.5 or has_fact_checks:
         return "medium"
+    return "low"
 
-    # Low confidence: weak NLI and no external validation
+
+def _calculate_claim_risk_level(
+    fact_check_status: str,
+    fact_check_confidence: str,
+    entailment_label: str,
+    entailment_confidence: float,
+) -> str:
+    if fact_check_status == "verified_false":
+        return "high"
+    if entailment_label == "refuted" and entailment_confidence >= 0.75:
+        return "high"
+    if (
+        fact_check_status in {"unverifiable", "pending"}
+        or fact_check_confidence == "low"
+        or entailment_label == "refuted"
+    ):
+        return "medium"
     return "low"
 
 
 def process_claims_table(batch_size: int = 50):
-    # pulls claims rows where any of the key fields are null and fills them in
-    # updates: sentiment_label, sentiment_score, fact_check_status, fact_check_confidence
     client = get_supabase_client()
 
-    # Fetch unprocessed claims (any of the fields is null)
     resp = (
         client.table("claims")
         .select(
-            "claim_id, claim_text, sentiment_label, sentiment_score, fact_check_status, fact_check_confidence"
+            "claim_id, claim_text, sentiment_label, sentiment_score, "
+            "fact_check_status, fact_check_confidence, risk_level"
         )
         .or_(
             "sentiment_label.is.null,"
             "sentiment_score.is.null,"
             "fact_check_status.is.null,"
-            "fact_check_confidence.is.null"
+            "fact_check_confidence.is.null,"
+            "risk_level.is.null"
         )
         .limit(batch_size)
         .execute()
@@ -604,24 +557,23 @@ def process_claims_table(batch_size: int = 50):
         print(f"    text: {claim_text[:100]}...")
 
         updates = {}
-
-        # --- sentiment_label + sentiment_score ---
         if row["sentiment_label"] is None or row["sentiment_score"] is None:
             sent_label, sent_score = _run_claim_sentiment(claim_text)
             updates["sentiment_label"] = sent_label
             updates["sentiment_score"] = sent_score
             print(f"    sentiment: {sent_label} ({sent_score:+.4f})")
 
-        # --- fact_check_status ---
         if row["fact_check_status"] is None:
             fc_status = _run_fact_check_status(claim_text)
             updates["fact_check_status"] = fc_status
             print(f"    fact_check_status: {fc_status}")
 
-        # --- fact_check_confidence ---
-        # Calculate fact_check_confidence if null (uses entailment for confidence calculation)
-        if row["fact_check_confidence"] is None:
+        entailment_label = "neutral"
+        entailment_conf = 0.0
+        if row["fact_check_confidence"] is None or row["risk_level"] is None:
             entailment_label, entailment_conf = check_entailment(claim_text)
+
+        if row["fact_check_confidence"] is None:
             fact_checks = search_fact_checks(claim_text, max_results=3)
             confidence = _calculate_fact_check_confidence(
                 entailment_conf, len(fact_checks) > 0
@@ -629,7 +581,31 @@ def process_claims_table(batch_size: int = 50):
             updates["fact_check_confidence"] = confidence
             print(f"    fact_check_confidence: {confidence}")
 
-        # --- Push update to Supabase ---
+        if row["risk_level"] is None:
+            effective_status = updates.get(
+                "fact_check_status", row["fact_check_status"]
+            )
+            effective_conf = updates.get(
+                "fact_check_confidence", row["fact_check_confidence"]
+            )
+            if effective_status is None:
+                effective_status = _run_fact_check_status(claim_text)
+                updates["fact_check_status"] = effective_status
+            if effective_conf is None:
+                fact_checks = search_fact_checks(claim_text, max_results=3)
+                effective_conf = _calculate_fact_check_confidence(
+                    entailment_conf, len(fact_checks) > 0
+                )
+                updates["fact_check_confidence"] = effective_conf
+            risk_level = _calculate_claim_risk_level(
+                fact_check_status=effective_status,
+                fact_check_confidence=effective_conf,
+                entailment_label=entailment_label,
+                entailment_confidence=entailment_conf,
+            )
+            updates["risk_level"] = risk_level
+            print(f"    risk_level: {risk_level}")
+
         if updates:
             client.table("claims").update(updates).eq("claim_id", claim_id).execute()
             print(f"    [OK] Updated claim {claim_id}\n")
@@ -643,94 +619,24 @@ def ids_from_supabase() -> list[str]:
     return [r["video_id"] for r in rows.data]
 
 
-def ids_from_supabase_without_misinfo() -> list[str]:
-    """
-    Pull video IDs from Supabase that do NOT already have a
-    misinfo check row in the insights table (model = 'misinfo').
-    """
+def ids_from_supabase_with_incomplete_claims(limit: int = 1000) -> list[str]:
     client = get_supabase_client()
-
-    # All video IDs
-    all_videos = client.table(SUPABASE_TABLE_VIDEOS).select("video_id").execute()
-    all_ids = {r["video_id"] for r in all_videos.data}
-
-    # Already checked
-    existing = (
-        client.table(SUPABASE_TABLE_INSIGHTS)
+    rows = (
+        client.table("claims")
         .select("video_id")
-        .eq("model", "misinfo")
+        .or_(
+            "sentiment_label.is.null,"
+            "sentiment_score.is.null,"
+            "fact_check_status.is.null,"
+            "fact_check_confidence.is.null,"
+            "risk_level.is.null"
+        )
+        .limit(limit)
         .execute()
     )
-    done_ids = {r["video_id"] for r in existing.data}
-
-    remaining = list(all_ids - done_ids)
-    print(
-        f"  {len(all_ids)} total videos, {len(done_ids)} already checked, {len(remaining)} remaining"
-    )
-    return remaining
-
-
-def push_misinfo_to_supabase(report: VideoMisinfoReport):
-    if report.error:
-        return
-
-    client = get_supabase_client()
-
-    claims_data = []
-    for c in report.claims_analyzed:
-        claims_data.append(
-            {
-                "claim_text": c.claim_text,
-                "claim_type": c.claim_type,
-                "claim_type_confidence": c.claim_type_confidence,
-                "entailment_label": c.entailment_label,
-                "entailment_confidence": c.entailment_confidence,
-                "fact_checks": [
-                    {
-                        "claim_text": fc.claim_text,
-                        "claimant": fc.claimant,
-                        "rating": fc.rating,
-                        "publisher": fc.publisher,
-                        "url": fc.url,
-                    }
-                    for fc in c.fact_checks
-                ],
-            }
-        )
-
-    # pattern matches found
-    narratives_data = [
-        {
-            "pattern": m.pattern_description,
-            "severity": m.severity,
-            "match_count": m.match_count,
-        }
-        for m in report.pattern_matches
-    ]
-
-    labels_data = {
-        "risk_level": report.risk_level,
-        "risk_reasons": report.risk_reasons,
-        "high_severity_count": report.high_severity_count,
-        "medium_severity_count": report.medium_severity_count,
-        "transcript_length_words": report.transcript_length_words,
-    }
-
-    # low risk = high confidence the video is clean, high risk = low confidence
-    confidence_map = {"low": 0.9, "medium": 0.6, "high": 0.3}
-    confidence = confidence_map.get(report.risk_level, 0.5)
-
-    row = {
-        "video_id": report.video_id,
-        "model": "misinfo",
-        "claims": json.dumps(claims_data),
-        "narratives": json.dumps(narratives_data),
-        "labels": json.dumps(labels_data),
-        "confidence": confidence,
-    }
-
-    client.table(SUPABASE_TABLE_INSIGHTS).insert(row).execute()
-    print(f"    [OK] Pushed misinfo report for {report.video_id} to Supabase")
+    video_ids = sorted({str(r["video_id"]) for r in rows.data})
+    print(f"  Found {len(video_ids)} video(s) with incomplete claim enrichment")
+    return video_ids
 
 
 RISK_ICONS = {"low": "[LOW]", "medium": "[MED]", "high": "[HIGH]"}
@@ -782,66 +688,40 @@ def print_report(report: VideoMisinfoReport):
     print()
 
 
-if __name__ == "__main__":
-    push_to_db = "--push" in sys.argv
-
-    # mode 4 is claims-table-only, skip the video pipeline
-    if len(sys.argv) > 1 and sys.argv[1] == "4":
-        batch = 50
-        if "--batch" in sys.argv:
-            idx = sys.argv.index("--batch")
-            if idx + 1 < len(sys.argv):
-                batch = int(sys.argv[idx + 1])
-        process_claims_table(batch_size=batch)
-        sys.exit(0)
-
-    # Parse --video flag
-    if "--video" in sys.argv:
-        idx = sys.argv.index("--video")
-        if idx + 1 >= len(sys.argv):
-            print("Usage: python misinfo_checker.py --video <VIDEO_ID>")
-            sys.exit(1)
-        video_ids = [sys.argv[idx + 1]]
-    else:
-        mode = sys.argv[1] if len(sys.argv) > 1 else None
-
-        if mode is None:
-            video_ids = ["dQw4w9WgXcQ", "T9itjMTqQ8Q"]
-        elif mode == "1":
-            if len(sys.argv) < 3:
-                print("Usage: python misinfo_checker.py 1 <path_to_ids.txt>")
-                sys.exit(1)
-            video_ids = ids_from_file(sys.argv[2])
-        elif mode == "2":
-            video_ids = ids_from_supabase()
-        elif mode == "3":
-            video_ids = ids_from_supabase_without_misinfo()
-            push_to_db = True  # auto-push when pulling unchecked from supabase
-        else:
-            print(
-                f"Unknown mode '{mode}'. Use: no args | 1 <file> | 2 | 3 | --video <ID>"
-            )
-            sys.exit(1)
-
+def run_misinfo_videos_pipeline(
+    video_ids: list[str],
+    *,
+    write_json: bool = False,
+    json_path: str = "misinfo_report.json",
+) -> dict:
+    """Run misinformation checks for a list of video IDs."""
     if not video_ids:
         print("No videos to check.")
-        sys.exit(0)
+        return {
+            "ok": True,
+            "video_ids": [],
+            "total": 0,
+            "checked": 0,
+            "failed": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+            "total_patterns": 0,
+            "total_claims": 0,
+            "saved_json": False,
+            "json_path": None,
+            "reports": [],
+        }
 
-    print(
-        f"Checking {len(video_ids)} video(s) for misinformation...  (push_to_db={push_to_db})\n"
-    )
+    print(f"Checking {len(video_ids)} video(s) for misinformation...\n")
 
-    all_reports = []
+    all_reports: list[VideoMisinfoReport] = []
     for i, vid in enumerate(video_ids, 1):
         print(f"[{i}/{len(video_ids)}] {vid}")
         report = check_video(vid)
         print_report(report)
         all_reports.append(report)
 
-        if push_to_db and report.error is None:
-            push_misinfo_to_supabase(report)
-
-    # Summary
     checked = [r for r in all_reports if r.error is None]
     failed = len(all_reports) - len(checked)
     high = sum(1 for r in checked if r.risk_level == "high")
@@ -865,9 +745,124 @@ if __name__ == "__main__":
         print(f"\n  [!] {high} video(s) flagged HIGH RISK -- review recommended")
     print(f"{'=' * 60}")
 
-    # Optionally dump full JSON
-    if "--json" in sys.argv:
+    saved_json = False
+    if write_json:
         output = [asdict(r) for r in all_reports]
-        json_path = Path("misinfo_report.json")
-        json_path.write_text(json.dumps(output, indent=2, default=str))
-        print(f"\nFull report saved to {json_path}")
+        path = Path(json_path)
+        path.write_text(json.dumps(output, indent=2, default=str))
+        print(f"\nFull report saved to {path}")
+        saved_json = True
+
+    return {
+        "ok": True,
+        "video_ids": [r.video_id for r in all_reports],
+        "total": len(all_reports),
+        "checked": len(checked),
+        "failed": failed,
+        "high": high,
+        "medium": medium,
+        "low": low,
+        "total_patterns": total_patterns,
+        "total_claims": total_claims,
+        "saved_json": saved_json,
+        "json_path": json_path if saved_json else None,
+        "reports": [asdict(r) for r in all_reports],
+    }
+
+
+def handler(event, context):
+    """
+    AWS Lambda entrypoint for misinformation checks.
+
+    `event` may provide:
+      - action: "videos" (default) or "claims_batch"
+      - video_ids: explicit list of IDs (for action == "videos")
+      - mode: None | "1" | "2" | "3" (mirrors CLI modes) for videos
+      - ids_file: path used with mode "1"
+      - write_json: bool
+      - json_path: output path for JSON
+      - batch_size: int (for action == "claims_batch")
+    """
+    del context  # unused
+
+    event = event or {}
+    if not isinstance(event, dict):
+        raise TypeError("event must be a dict or None")
+
+    action = event.get("action", "videos")
+
+    if action == "claims_batch":
+        batch_size = int(event.get("batch_size", 50))
+        process_claims_table(batch_size=batch_size)
+        return {"ok": True, "action": "claims_batch", "batch_size": batch_size}
+
+    write_json = bool(event.get("write_json", False))
+    json_path = event.get("json_path", "misinfo_report.json")
+
+    if "video_ids" in event and event["video_ids"]:
+        video_ids = list(event["video_ids"])
+    else:
+        mode = event.get("mode")
+
+        if mode is None:
+            video_ids = ["dQw4w9WgXcQ", "T9itjMTqQ8Q"]
+        elif mode == "1":
+            ids_file = event.get("ids_file")
+            if not ids_file:
+                raise ValueError("ids_file is required when mode == '1'")
+            video_ids = ids_from_file(ids_file)
+        elif mode == "2":
+            video_ids = ids_from_supabase()
+        elif mode == "3":
+            video_ids = ids_from_supabase_with_incomplete_claims()
+        else:
+            raise ValueError(
+                f"Unknown mode '{mode}'. Use: None | '1' with ids_file | '2' | '3'"
+            )
+
+    return run_misinfo_videos_pipeline(
+        video_ids, write_json=write_json, json_path=json_path
+    )
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "4":
+        batch = 50
+        if "--batch" in sys.argv:
+            idx = sys.argv.index("--batch")
+            if idx + 1 < len(sys.argv):
+                batch = int(sys.argv[idx + 1])
+        process_claims_table(batch_size=batch)
+        sys.exit(0)
+
+    write_json = "--json" in sys.argv
+
+    if "--video" in sys.argv:
+        idx = sys.argv.index("--video")
+        if idx + 1 >= len(sys.argv):
+            print("Usage: python misinfo_checker.py --video <VIDEO_ID>")
+            sys.exit(1)
+        video_ids = [sys.argv[idx + 1]]
+    else:
+        mode = sys.argv[1] if len(sys.argv) > 1 else None
+
+        if mode is None:
+            video_ids = ["dQw4w9WgXcQ", "T9itjMTqQ8Q"]
+        elif mode == "1":
+            if len(sys.argv) < 3:
+                print("Usage: python misinfo_checker.py 1 <path_to_ids.txt>")
+                sys.exit(1)
+            video_ids = ids_from_file(sys.argv[2])
+        elif mode == "2":
+            video_ids = ids_from_supabase()
+        elif mode == "3":
+            video_ids = ids_from_supabase_with_incomplete_claims()
+        else:
+            print(
+                f"Unknown mode '{mode}'. Use: no args | 1 <file> | 2 | 3 | --video <ID>"
+            )
+            sys.exit(1)
+
+    run_misinfo_videos_pipeline(
+        video_ids, write_json=write_json, json_path="misinfo_report.json"
+    )
