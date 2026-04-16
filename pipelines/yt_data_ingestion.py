@@ -14,8 +14,7 @@ from googleapiclient.errors import HttpError
 from supabase import create_client
 from youtube_transcript_api import YouTubeTranscriptApi
 
-from pipelines.llm_insight_generation import BedrockProvider, OllamaProvider
-from pipelines.shared import LLMProvider
+from pipelines.shared import BedrockProvider, LLMProvider, OllamaProvider
 
 # YouTube Data API v3 quota unit costs per request.
 # Source: https://developers.google.com/youtube/v3/determine_quota_cost
