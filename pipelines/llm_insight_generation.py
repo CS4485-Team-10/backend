@@ -1,25 +1,4 @@
-"""
-LLM Insight Generation Pipeline.
-
-Reads transcripts from Supabase (only those without existing claims),
-extracts claims via an LLM, semantically matches or creates narratives,
-and persists claims, narratives, and claim_narratives back to Supabase.
-
-**First-pass ownership:** this module normalizes LLM JSON, writes ``claim_text`` and
-``llm_confidence``, and inserts *new* narrative rows from extraction metadata when
-no semantic match exists. Sentiment, fact-check, and risk enrichment are owned by
-other pipelines and are not applied here.
-Narrative embeddings are only used for semantic matching/dedup against
-existing narrative rows, not for LLM extraction. Production defaults to
-``NARR_EMBEDDING_BACKEND=remote`` (Google Gemini ``embedContent``): set
-``NARR_EMBEDDING_URL`` to the full ``.../models/<id>:embedContent`` URL,
-``NARR_EMBEDDING_API_KEY`` (Google AI key, ``x-goog-api-key``), and optionally
-``NARR_EMBEDDING_MODEL``, ``NARR_EMBEDDING_TIMEOUT`` (see
-``pipelines.narrative_matching``).
-
-Re-runs are safe: prior claims and bridge rows for a transcript are
-deleted before new ones are inserted (replace semantics for CRON jobs).
-"""
+"""Extract claims, match narratives, and persist first-pass insights."""
 
 from __future__ import annotations
 
@@ -28,11 +7,10 @@ import logging
 import math
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import requests
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -44,7 +22,7 @@ from pipelines.narrative_matching import (
     match_claim_to_narratives,
     refresh_pool_with_new,
 )
-from pipelines.shared import LLMProvider
+from pipelines.shared import BedrockProvider, LLMProvider, OllamaProvider
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +36,10 @@ SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 _PAGE_SIZE = 1000
+_DEFAULT_TIME_BUFFER_MS = 180_000
+_DEFAULT_TRANSCRIPT_BATCH_LIMIT = 20
+_MAX_TRANSCRIPT_ATTEMPTS = 5
+_DEFAULT_IN_PROGRESS_STALE_MINUTES = 30
 
 # Defensive max lengths for parsed LLM fields (downstream of JSON only; prompts unchanged).
 _MAX_CLAIM_TEXT_CHARS = 100_000
@@ -105,7 +87,7 @@ def _normalize_confidence(raw: Any) -> Optional[float]:
 
 
 def _normalize_parsed_claim(raw: Any) -> Optional[Dict[str, Any]]:
-    """Return a canonical claim dict, or None if the entry is unusable."""
+    """Return a canonical claim dict, or None."""
     if not isinstance(raw, dict):
         log.debug("Skipping non-dict claim entry: %s", type(raw).__name__)
         return None
@@ -152,50 +134,93 @@ def _get_supabase():
 # ---------------------------------------------------------------------------
 
 
-def _fetch_transcripts_without_claims(sb) -> List[Dict[str, Any]]:
-    """Return transcripts rows that have no corresponding claims yet.
+def _get_stale_in_progress_threshold_utc() -> datetime:
+    """Return the cutoff time for considering an in_progress row stale."""
+    raw = os.environ.get("LLM_INSIGHT_STALE_IN_PROGRESS_MINUTES")
+    try:
+        minutes = int(raw) if raw else _DEFAULT_IN_PROGRESS_STALE_MINUTES
+    except ValueError:
+        minutes = _DEFAULT_IN_PROGRESS_STALE_MINUTES
+    return datetime.now(timezone.utc) - timedelta(minutes=max(minutes, 0))
 
-    Uses Supabase PostgREST: fetch all transcripts, then subtract those
-    whose transcript_id already appears in claims (set difference in Python
-    since PostgREST has limited subquery support).
+
+def _release_stale_in_progress(sb) -> None:
+    """Move stale in_progress rows back to pending so they can be retried.
+
+    Does not change attempt_count. Only rows still under the attempt cap are
+    touched so retry-capped transcripts remain excluded.
     """
-    all_transcripts: List[Dict[str, Any]] = []
-    offset = 0
-    while True:
-        page = (
-            sb.table("transcripts")
-            .select("video_id, transcript_id, cleaned_transcript_txt")
-            .range(offset, offset + _PAGE_SIZE - 1)
-            .execute()
+    threshold = _get_stale_in_progress_threshold_utc().isoformat()
+    try:
+        sb.table("transcripts").update({"processing_status": "pending"}).eq(
+            "processing_status", "in_progress"
+        ).lt("attempt_count", _MAX_TRANSCRIPT_ATTEMPTS).lt(
+            "last_attempted_at", threshold
+        ).execute()
+        sb.table("transcripts").update({"processing_status": "pending"}).eq(
+            "processing_status", "in_progress"
+        ).lt("attempt_count", _MAX_TRANSCRIPT_ATTEMPTS).is_(
+            "last_attempted_at", "null"
+        ).execute()
+    except Exception:
+        log.exception("Failed to release stale in_progress transcripts")
+
+
+def _fetch_pending_transcripts(
+    sb, *, limit: int = _DEFAULT_TRANSCRIPT_BATCH_LIMIT
+) -> List[Dict[str, Any]]:
+    """Return pending transcripts still under the attempt cap, capped at `limit`."""
+    resp = (
+        sb.table("transcripts")
+        .select(
+            "video_id, transcript_id, cleaned_transcript_txt, "
+            "processing_status, attempt_count"
         )
-        all_transcripts.extend(page.data)
-        if len(page.data) < _PAGE_SIZE:
-            break
-        offset += _PAGE_SIZE
+        .eq("processing_status", "pending")
+        .lt("attempt_count", _MAX_TRANSCRIPT_ATTEMPTS)
+        .order("created_at", desc=False)
+        .order("transcript_id", desc=False)
+        .limit(limit)
+        .execute()
+    )
+    return list(resp.data or [])
 
-    if not all_transcripts:
-        return []
 
-    claimed_ids: set[str] = set()
-    offset = 0
-    while True:
-        page = (
-            sb.table("claims")
-            .select("transcript_id")
-            .range(offset, offset + _PAGE_SIZE - 1)
-            .execute()
-        )
-        for row in page.data:
-            claimed_ids.add(str(row["transcript_id"]))
-        if len(page.data) < _PAGE_SIZE:
-            break
-        offset += _PAGE_SIZE
+def _mark_transcript_in_progress(sb, transcript_id: str, attempt_count: int) -> None:
+    """Mark transcript as in-progress and record this attempt."""
+    sb.table("transcripts").update(
+        {
+            "processing_status": "in_progress",
+            "attempt_count": attempt_count + 1,
+            "last_attempted_at": datetime.now(timezone.utc).isoformat(),
+        }
+    ).eq("transcript_id", transcript_id).execute()
 
-    return [t for t in all_transcripts if str(t["transcript_id"]) not in claimed_ids]
+
+def _mark_transcript_done(sb, transcript_id: str) -> None:
+    """Mark transcript as done after successful insight persistence."""
+    sb.table("transcripts").update({"processing_status": "done"}).eq(
+        "transcript_id", transcript_id
+    ).execute()
+
+
+def _reset_transcript_to_pending(sb, transcript_id: str) -> None:
+    """Reset transcript to pending so future invocations can retry.
+
+    Used when an attempt fails or yields no claims. Without a `failed` state,
+    this prevents rows from being stranded in `in_progress` after Lambda
+    interruptions while keeping retries idempotent.
+    """
+    try:
+        sb.table("transcripts").update({"processing_status": "pending"}).eq(
+            "transcript_id", transcript_id
+        ).execute()
+    except Exception:
+        log.exception("Failed to reset transcript %s to pending", transcript_id)
 
 
 def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
-    """Paginated fetch of all rows from the narratives table."""
+    """Return all narrative rows via pagination."""
     rows: List[Dict[str, Any]] = []
     offset = 0
     while True:
@@ -216,12 +241,12 @@ def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Replace-semantics: delete old insights for a transcript
+# 2. Replace existing transcript claims
 # ---------------------------------------------------------------------------
 
 
 def _delete_existing_insights(sb, transcript_id: str) -> None:
-    """Remove claim_narratives and claims for *transcript_id* (FK-safe order)."""
+    """Delete old bridge rows and claims for a transcript."""
     existing_claims = (
         sb.table("claims")
         .select("claim_id")
@@ -243,7 +268,7 @@ def _delete_existing_insights(sb, transcript_id: str) -> None:
 
 
 def _chunk_text(text: str, max_chars: int = 12000) -> List[str]:
-    """Split long transcript text into chunks to fit model context limits."""
+    """Split transcript text into model-sized chunks."""
     paragraphs = text.split("\n\n")
     chunks: List[str] = []
     buffer: List[str] = []
@@ -374,7 +399,7 @@ Transcript:
 
 
 def _validate_json_output(text: str) -> Dict[str, Any]:
-    """Parse and validate the LLM JSON output."""
+    """Parse and validate JSON output."""
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
@@ -396,12 +421,7 @@ def _extract_claims(
     max_chars: int = 12000,
     retries: int = 2,
 ) -> List[Dict[str, Any]]:
-    """Chunk transcript, call LLM per chunk, normalize, dedupe, and return claims.
-
-    Each list item is a canonical dict (see :func:`_normalize_parsed_claim`).
-    Dedupe uses normalized ``text``; **first occurrence wins** for narrative
-    metadata when the same text appears in multiple chunks.
-    """
+    """Chunk transcript, call LLM, normalize, dedupe, return claims."""
     chunks = _chunk_text(transcript_text, max_chars=max_chars)
     raw_items: List[Any] = []
 
@@ -439,131 +459,8 @@ def _extract_claims(
 # ---------------------------------------------------------------------------
 
 
-class OllamaProvider(LLMProvider):
-    """Calls local Ollama using an OpenAI-compatible endpoint."""
-
-    name = "ollama"
-
-    def __init__(
-        self,
-        model: str = "qwen3",
-        base_url: str = "http://localhost:11434/v1",
-    ):
-        super().__init__(provider="ollama", model=model)
-        self.base_url = base_url.rstrip("/")
-
-    def generate_response(self, *, system: str, user_prompt: str) -> str:
-        url = f"{self.base_url}/chat/completions"
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.3,
-            "stream": False,
-        }
-        resp = requests.post(url, json=payload, timeout=120)
-        if not resp.ok:
-            err_msg = resp.text
-            try:
-                err = resp.json()
-                if isinstance(err.get("error"), dict):
-                    err_msg = err["error"].get("message", err_msg)
-                elif isinstance(err.get("error"), str):
-                    err_msg = err["error"]
-            except Exception:
-                pass
-            hint = ""
-            if "not found" in err_msg.lower():
-                hint = " Run `ollama pull <model>` (see LLM_MODEL) to download a model first."
-            raise RuntimeError(
-                f"Ollama API error ({resp.status_code}): {err_msg}.{hint}"
-            ) from None
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
-
-
-class BedrockProvider(LLMProvider):
-    """Calls Amazon Bedrock using the Converse API with Qwen3-VL-235B-A22B or other models."""
-
-    name = "bedrock"
-
-    def __init__(self, model: str = "qwen3-vl-235b-a22b", region: str = "us-east-1"):
-        super().__init__(provider="bedrock", model=model)
-        self.region = region
-        self._client = None
-
-    def _get_client(self):
-        """Lazy-load boto3 client (only imported when BedrockProvider is used)."""
-        if self._client is None:
-            try:
-                import boto3
-            except ImportError:
-                raise ImportError(
-                    "boto3 is required for BedrockProvider. "
-                    "Install it with: pip install boto3"
-                ) from None
-
-            self._client = boto3.client(
-                service_name="bedrock-runtime", region_name=self.region
-            )
-        return self._client
-
-    def generate_response(self, *, system: str, user_prompt: str) -> str:
-        """
-        Call Amazon Bedrock Converse API.
-
-        Uses AWS credentials from environment (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-        or from ~/.aws/credentials file.
-        """
-        client = self._get_client()
-
-        try:
-            response = client.converse(
-                modelId=self.model,
-                messages=[{"role": "user", "content": [{"text": user_prompt}]}],
-                system=[{"text": system}],
-                inferenceConfig={
-                    "temperature": 0.3,
-                    "maxTokens": 4096,
-                },
-            )
-
-            # Extract text from response
-            output = response.get("output", {})
-            message = output.get("message", {})
-            content = message.get("content", [])
-
-            if not content:
-                raise RuntimeError("Bedrock returned empty response")
-
-            # Get the text from first content block
-            return content[0].get("text", "")
-
-        except Exception as e:
-            # Provide helpful error messages
-            error_msg = str(e)
-            if "AccessDeniedException" in error_msg:
-                raise RuntimeError(
-                    "AWS credentials not configured or invalid. "
-                    "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables "
-                    "or configure ~/.aws/credentials"
-                ) from e
-            elif (
-                "ResourceNotFoundException" in error_msg
-                or "ValidationException" in error_msg
-            ):
-                raise RuntimeError(
-                    f"Model '{self.model}' not found in region '{self.region}'. "
-                    "Verify model ID and ensure you have access to it in Bedrock."
-                ) from e
-            else:
-                raise RuntimeError(f"Bedrock API error: {error_msg}") from e
-
-
 def _get_provider_from_env() -> LLMProvider:
-    """Create LLM provider from LLM_PROVIDER and LLM_MODEL env vars."""
+    """Build provider from environment settings."""
     provider_name = (os.environ.get("LLM_PROVIDER") or "ollama").lower()
     model = os.environ.get("LLM_MODEL") or "qwen3"
     base_url = os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
@@ -590,28 +487,9 @@ def _persist_insights(
     narrative_assignments: List[MatchDecision],
     new_narratives: List[NarrativeCandidate],
 ) -> int:
-    """Insert narratives, claims, and claim_narratives to Supabase.
-
-    *claims* must be canonical dicts from :func:`_normalize_parsed_claim` (``text``,
-    ``confidence``, narrative keys). *narrative_assignments* must be parallel to
-    *claims* and list :class:`~pipelines.narrative_matching.MatchDecision` in the
-    same order so ``zip(claim_ids, narrative_assignments)`` aligns bridge rows.
-
-    Row payloads use these Supabase columns:
-    ``claims``: ``claim_id``, ``video_id``, ``transcript_id``, ``claim_text``,
-    ``llm_confidence``, ``created_at``. ``narratives``: ``narrative_id``,
-    ``narrative_label``, ``narrative_risk_score``, ``narrative_category``,
-    ``narrative_description``, ``narrative_details``, ``created_at``.
-    ``claim_narratives``: ``claim_id``, ``narrative_id``, ``created_at``.
-
-    When a claim matched an *existing* narrative, that narrative row is not updated
-    here; only bridge rows link the new claim to the existing ``narrative_id``.
-
-    Returns the number of claims inserted.
-    """
+    """Insert narratives, claims, and bridge rows."""
     now = datetime.now(timezone.utc).isoformat()
 
-    # 1. Insert new narratives (only rows created in this run; see MatchDecision.new_narrative)
     if new_narratives:
         narr_rows = [
             {
@@ -627,7 +505,6 @@ def _persist_insights(
         ]
         sb.table("narratives").insert(narr_rows).execute()
 
-    # 2. Insert claims
     claim_rows = []
     claim_ids: List[str] = []
     for c in claims:
@@ -646,7 +523,6 @@ def _persist_insights(
     if claim_rows:
         sb.table("claims").insert(claim_rows).execute()
 
-    # 3. Insert claim_narratives bridge rows
     bridge_rows = []
     for cid, decision in zip(claim_ids, narrative_assignments):
         for nid in decision.linked_narrative_ids:
@@ -668,37 +544,56 @@ def _persist_insights(
 # ---------------------------------------------------------------------------
 
 
+def _get_time_buffer_ms() -> int:
+    """Return the safety buffer before Lambda hard timeout."""
+    raw = os.environ.get("LLM_INSIGHT_TIME_BUFFER_MS")
+    if not raw:
+        return _DEFAULT_TIME_BUFFER_MS
+    try:
+        value = int(raw)
+        return max(value, 0)
+    except ValueError:
+        return _DEFAULT_TIME_BUFFER_MS
+
+
+def _get_remaining_ms(context) -> Optional[int]:
+    """Best-effort remaining time from AWS Lambda context, or None locally."""
+    if context is None:
+        return None
+    getter = getattr(context, "get_remaining_time_in_millis", None)
+    if not callable(getter):
+        return None
+    try:
+        return int(getter())
+    except Exception:
+        return None
+
+
 def run_llm_insight_generation_pipeline(
     *,
     provider: LLMProvider | None = None,
+    lambda_context=None,
 ) -> dict:
-    """Main entrypoint for the LLM insight generation pipeline.
-
-    Reads transcripts from Supabase that have no claims yet, runs LLM
-    extraction, matches/creates narratives, and persists all rows.
-    Safe for repeated / CRON invocations: existing claims for a
-    transcript are deleted before re-inserting (replace semantics).
-
-    Semantic matches attach claims to **existing** narrative rows without
-    rewriting those rows; extraction-only narrative metadata is consumed when
-    :func:`pipelines.narrative_matching.match_claim_to_narratives` creates a **new**
-    narrative.
-
-    Run locally:
-        conda activate yt-intel-project
-        python -m pipelines.llm_insight_generation
-
-    Returns
-    -------
-    dict with keys: video_ids, total_claims, total_new_narratives
-    """
+    """Run end-to-end claim extraction and narrative persistence."""
     sb = _get_supabase()
     prov = provider or _get_provider_from_env()
 
-    transcripts = _fetch_transcripts_without_claims(sb)
+    _release_stale_in_progress(sb)
+
+    transcripts = _fetch_pending_transcripts(sb)
     if not transcripts:
-        log.info("No unprocessed transcripts found.")
-        return {"video_ids": [], "total_claims": 0, "total_new_narratives": 0}
+        log.info("No pending transcripts found.")
+        return {
+            "video_ids": [],
+            "total_claims": 0,
+            "total_new_narratives": 0,
+            "stopped_early": False,
+            "reason": None,
+            "last_completed_transcript_id": None,
+            "next_transcript_id": None,
+            "remaining_ms": _get_remaining_ms(lambda_context),
+            "buffer_ms": _get_time_buffer_ms(),
+        }
 
     log.info("Processing %d transcript(s)", len(transcripts))
 
@@ -711,18 +606,42 @@ def run_llm_insight_generation_pipeline(
     total_claims = 0
     total_new_narratives = 0
     processed_video_ids: List[str] = []
+    buffer_ms = _get_time_buffer_ms()
+    remaining_ms = _get_remaining_ms(lambda_context)
+    last_completed_transcript_id: Optional[str] = None
 
-    for t in transcripts:
+    for idx, t in enumerate(transcripts):
+        remaining_ms = _get_remaining_ms(lambda_context)
+        if remaining_ms is not None and remaining_ms <= buffer_ms:
+            next_transcript_id = str(t["transcript_id"])
+            return {
+                "video_ids": processed_video_ids,
+                "total_claims": total_claims,
+                "total_new_narratives": total_new_narratives,
+                "stopped_early": True,
+                "reason": "time_budget",
+                "last_completed_transcript_id": last_completed_transcript_id,
+                "next_transcript_id": next_transcript_id,
+                "remaining_ms": remaining_ms,
+                "buffer_ms": buffer_ms,
+            }
+
         video_id = t["video_id"]
         transcript_id = str(t["transcript_id"])
         text = t["cleaned_transcript_txt"]
+        current_attempts = int(t.get("attempt_count") or 0)
 
         try:
-            _delete_existing_insights(sb, transcript_id)
+            _mark_transcript_in_progress(sb, transcript_id, current_attempts)
 
             claims = _extract_claims(text, prov)
             if not claims:
-                log.info("%s: 0 claims extracted, skipping.", video_id)
+                # Extraction succeeded but yielded nothing. Preserve any prior
+                # insights and mark the transcript done so we don't loop on it.
+                log.info("%s: 0 claims extracted, marking done.", video_id)
+                _mark_transcript_done(sb, transcript_id)
+                processed_video_ids.append(video_id)
+                last_completed_transcript_id = transcript_id
                 continue
 
             decisions: List[MatchDecision] = []
@@ -753,12 +672,18 @@ def run_llm_insight_generation_pipeline(
                         embedder=embedder,
                     )
 
+            # Only clear prior insights now that extraction has succeeded and
+            # we have new claims ready to persist.
+            _delete_existing_insights(sb, transcript_id)
+
             inserted = _persist_insights(
                 sb, video_id, transcript_id, claims, decisions, run_new_narratives
             )
+            _mark_transcript_done(sb, transcript_id)
             total_claims += inserted
             total_new_narratives += len(run_new_narratives)
             processed_video_ids.append(video_id)
+            last_completed_transcript_id = transcript_id
             log.info(
                 "%s: %d claims, %d new narratives",
                 video_id,
@@ -767,12 +692,34 @@ def run_llm_insight_generation_pipeline(
             )
         except Exception:
             log.exception("Failed to process %s", video_id)
+            # Without a dedicated `failed` state, reset to pending so the next
+            # invocation can retry rather than leaving the row stuck in-progress.
+            _reset_transcript_to_pending(sb, transcript_id)
 
+    remaining_ms = _get_remaining_ms(lambda_context)
     return {
         "video_ids": processed_video_ids,
         "total_claims": total_claims,
         "total_new_narratives": total_new_narratives,
+        "stopped_early": False,
+        "reason": None,
+        "last_completed_transcript_id": last_completed_transcript_id,
+        "next_transcript_id": None,
+        "remaining_ms": remaining_ms,
+        "buffer_ms": buffer_ms,
     }
+
+
+def handler(event, context):
+    """
+    AWS Lambda entrypoint for LLM insight generation.
+
+    `event` is currently unused but reserved for future tuning; all configuration
+    comes from environment variables and the database.
+    """
+    del event  # unused for now; kept for future extension
+    result = run_llm_insight_generation_pipeline(lambda_context=context)
+    return {"ok": True, **result}
 
 
 if __name__ == "__main__":

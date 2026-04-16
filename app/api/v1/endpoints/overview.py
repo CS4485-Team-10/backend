@@ -1,14 +1,15 @@
+import math
 from collections import defaultdict
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends
-from sqlmodel import Session, select, func
+from sqlmodel import Session, col, func, select
 
 from app.core.database import get_session
-from app.models.video import Video
 from app.models.claim import Claim
-from app.models.narrative import Narrative
 from app.models.claim_narrative import ClaimNarrative
+from app.models.narrative import Narrative
+from app.models.video import Video
 from app.schemas.overview import (
     ExecutiveOverviewResponse,
     OverviewStatsResponse,
@@ -64,8 +65,6 @@ def executive_overview(session: Session = Depends(get_session)):
         .where(Narrative.created_at >= thirty_days_ago)
     ).one()
 
-    total_claims = session.exec(select(func.count()).select_from(Claim)).one()
-
     # ── topic trends (real) ────────────────────────────────────
     # Find top 4 narrative labels by claim count
     top_narratives_rows = session.exec(
@@ -108,21 +107,43 @@ def executive_overview(session: Session = Depends(get_session)):
             entry: dict = {"date": date_key, **buckets[date_key]}
             topic_trends.append(entry)
 
-    # ── placeholder data (DB gaps) ─────────────────────────────
-    # TODO: replace with verified-only count once claims.verification_status column exists
-    verified_claims = total_claims
+    # ── derived from real data ──────────────────────────────────
+    verified_claims = session.exec(
+        select(func.count())
+        .select_from(Claim)
+        .where(col(Claim.fact_check_status).ilike("verified"))
+    ).one()
 
-    # TODO: compute from real verification data
-    accuracy_pct = 87
+    disputed_claims = session.exec(
+        select(func.count())
+        .select_from(Claim)
+        .where(col(Claim.fact_check_status).ilike("disputed"))
+    ).one()
 
-    # TODO: query alerts table once it exists
-    high_risk_alerts = 0
+    checked_total = verified_claims + disputed_claims
+    accuracy_pct = (
+        round(verified_claims / checked_total * 100) if checked_total > 0 else 0
+    )
 
-    # TODO: derive from alerts review status
-    status_label = "No data yet"
+    high_risk_alerts = session.exec(
+        select(func.count())
+        .select_from(Narrative)
+        .where(Narrative.narrative_risk_score >= 7.0)
+    ).one()
 
-    # TODO: compute from real claim/narrative confidence scores
-    confidence_score_pct = 92
+    if high_risk_alerts == 0:
+        status_label = "All clear"
+    elif high_risk_alerts <= 3:
+        status_label = "Monitoring"
+    else:
+        status_label = "Action needed"
+
+    avg_confidence = session.exec(
+        select(func.avg(Claim.llm_confidence)).where(
+            Claim.llm_confidence.is_not(None)  # type: ignore[union-attr]
+        )
+    ).one()
+    confidence_score_pct = round(float(avg_confidence) * 100) if avg_confidence else 0
 
     return ExecutiveOverviewResponse(
         total_videos_scoped=total_videos,
@@ -154,14 +175,34 @@ def executive_overview(session: Session = Depends(get_session)):
     )
 
 
-# TODO: replace with real clustering from narrative embeddings / semantic similarity
 @router.get("/overview/topic-clusters", response_model=TopicClustersResponse)
-def topic_clusters():
-    return TopicClustersResponse(
-        clusters=[
-            {"label": "Health & Wellness", "size": 42, "x": 0.32, "y": 0.55},
-            {"label": "AI & Technology", "size": 28, "x": 0.51, "y": 0.41},
-            {"label": "Crypto & Finance", "size": 34, "x": 0.63, "y": 0.66},
-            {"label": "Nutrition", "size": 18, "x": 0.76, "y": 0.48},
-        ],
-    )
+def topic_clusters(session: Session = Depends(get_session)):
+    rows = session.exec(
+        select(
+            Narrative.narrative_category,
+            func.count(ClaimNarrative.claim_id).label("size"),
+        )
+        .outerjoin(
+            ClaimNarrative,
+            Narrative.narrative_id == ClaimNarrative.narrative_id,
+        )
+        .group_by(Narrative.narrative_category)
+        .order_by(func.count(ClaimNarrative.claim_id).desc())
+    ).all()
+
+    clusters: list[dict] = []
+    total = len(rows)
+    for idx, (category, size) in enumerate(rows):
+        # Distribute points in a grid-like pattern for visual spread
+        angle = (idx / max(total, 1)) * 3.14159 * 2
+        radius = 0.25 + (idx % 3) * 0.1
+        clusters.append(
+            {
+                "label": category or "Uncategorized",
+                "size": size,
+                "x": round(0.5 + radius * math.cos(angle), 2),
+                "y": round(0.5 + radius * math.sin(angle), 2),
+            }
+        )
+
+    return TopicClustersResponse(clusters=clusters)

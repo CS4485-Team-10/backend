@@ -5,9 +5,15 @@ from .data_models import (
     LLMProvider,
     TranscriptRecord,
 )
+from .llm_providers import (
+    BedrockProvider,
+    OllamaProvider,
+)
 
 __all__ = [
+    "BedrockProvider",
     "GeneratedInsights",
     "LLMProvider",
+    "OllamaProvider",
     "TranscriptRecord",
 ]

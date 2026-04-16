@@ -1,8 +1,10 @@
 from fastapi import APIRouter
 
 from app.api.v1.endpoints import (
+    alerts,
     channels,
     claims,
+    creators,
     health,
     ingest,
     narratives,
@@ -22,3 +24,5 @@ api_router.include_router(narratives.router, tags=["narratives"])
 api_router.include_router(claims.router, tags=["claims"])
 api_router.include_router(transcripts.router, tags=["transcripts"])
 api_router.include_router(ingest.router, tags=["ingest"])
+api_router.include_router(creators.router, tags=["creators"])
+api_router.include_router(alerts.router, tags=["alerts"])

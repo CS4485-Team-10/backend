@@ -1,12 +1,4 @@
-"""
-YouTube Data Ingestion Pipeline.
-
-1. Pull official YouTube metadata via Google's YouTube Data API
-2. Semantic filter by public health relevance (LLM-based)
-3. Filter by metadata impact
-4. Pull transcripts via youtube-transcript-api
-5. Persist to Supabase (videos, transcripts)
-"""
+"""Fetch YouTube metadata/transcripts and store videos + transcripts."""
 
 import json
 import math
@@ -22,8 +14,7 @@ from googleapiclient.errors import HttpError
 from supabase import create_client
 from youtube_transcript_api import YouTubeTranscriptApi
 
-from pipelines.llm_insight_generation import BedrockProvider, OllamaProvider
-from pipelines.shared import LLMProvider
+from pipelines.shared import BedrockProvider, LLMProvider, OllamaProvider
 
 # YouTube Data API v3 quota unit costs per request.
 # Source: https://developers.google.com/youtube/v3/determine_quota_cost
@@ -45,12 +36,7 @@ _DEFAULT_SEARCH_QUERIES = [
 
 
 class QuotaBudget:
-    """Tracks YouTube Data API quota unit consumption against a budget.
-
-    Call ``try_consume`` before every API request.  When the budget is
-    exhausted the method returns ``False`` and records the breach context
-    so callers can stop gracefully.
-    """
+    """Track consumed YouTube API quota against a budget."""
 
     def __init__(self, budget: int = _DEFAULT_QUOTA_BUDGET):
         self.budget = budget
@@ -64,7 +50,7 @@ class QuotaBudget:
         return max(self.budget - self.used, 0)
 
     def try_consume(self, cost: int, *, stage: str = "", detail: str = "") -> bool:
-        """Attempt to consume *cost* units.  Returns True on success."""
+        """Consume cost units if still within budget."""
         if self.used + cost > self.budget:
             if not self.breached:
                 self.breached = True
@@ -83,13 +69,13 @@ class QuotaBudget:
 
 
 def _chunk_video_ids(lst: List[str], n: int):
-    """Break video_ids into smaller chunks for API request limits."""
+    """Yield chunks of IDs."""
     for i in range(0, len(lst), n):
         yield lst[i : i + n]
 
 
 def _reraise_if_youtube_quota_exceeded(err: HttpError) -> None:
-    """Turn opaque 403 quota errors into a short, actionable message."""
+    """Raise a clear error for quota-exceeded responses."""
     if err.resp.status != 403:
         raise err
     body = (err.content or b"").decode("utf-8", errors="replace")
@@ -106,7 +92,7 @@ def _reraise_if_youtube_quota_exceeded(err: HttpError) -> None:
 def _fetch_video_metadata(
     youtube, video_ids: List[str], budget: QuotaBudget
 ) -> List[dict]:
-    """Fetch hydrated video metrics (snippet, statistics, contentDetails) for given IDs."""
+    """Fetch snippet/statistics/contentDetails for video IDs."""
     all_items: List[dict] = []
     for job in _chunk_video_ids(video_ids, 50):
         if not budget.try_consume(
@@ -132,7 +118,7 @@ def _fetch_video_metadata(
 
 
 def _compute_impact_features(vid_metadata: dict) -> dict:
-    """Compute derived impact features from a video metadata dict."""
+    """Compute impact features from metadata."""
     stats = vid_metadata.get("statistics", {})
     snippet = vid_metadata.get("snippet", {})
 
@@ -140,14 +126,12 @@ def _compute_impact_features(vid_metadata: dict) -> dict:
     comment_count = int(stats.get("commentCount", 0))
     like_count = int(stats.get("likeCount", 0))
     published_at = datetime.fromisoformat(snippet["publishedAt"].replace("Z", "+00:00"))
-    published_at = datetime.fromisoformat(snippet["publishedAt"].replace("Z", "+00:00"))
     days_since = max(
         (datetime.now(timezone.utc) - published_at).days,
         1,
     )
 
     views_per_day = view_count / days_since
-    comments_per_1kviews = (comment_count / view_count) * 1000 if view_count > 0 else 0
     comments_per_1kviews = (comment_count / view_count) * 1000 if view_count > 0 else 0
     likes_per_1kviews = (like_count / view_count) * 1000 if view_count > 0 else 0
 
@@ -173,10 +157,9 @@ def _compute_impact_features(vid_metadata: dict) -> dict:
 def _filter_ws_by_percentile(
     scored_videos: List[dict], percentile: float = 0.9
 ) -> List[dict]:
-    """Keep videos above the given percentile of impact_score (e.g. 0.9 = top 10%)."""
+    """Keep videos above the impact-score percentile."""
     if not scored_videos:
         return []
-    scored_videos = sorted(scored_videos, key=lambda x: x["impact_score"], reverse=True)
     scored_videos = sorted(scored_videos, key=lambda x: x["impact_score"], reverse=True)
     cutoff_index = min(
         int(len(scored_videos) * percentile),
@@ -187,7 +170,7 @@ def _filter_ws_by_percentile(
 
 
 def _clean_transcript(transcript_data: Union[List[Dict], str]) -> str:
-    """Clean a YouTube transcript by removing noise and formatting artifacts."""
+    """Clean transcript noise and formatting artifacts."""
     if isinstance(transcript_data, str):
         text = transcript_data
     else:
@@ -249,25 +232,23 @@ Return ONLY valid JSON in this format:
 
 
 def _get_llm_provider_for_filtering() -> LLMProvider:
-    """Create LLM provider for semantic filtering from YT_SEMANTIC_FILTER_PROVIDER & YT_SEMANTIC_FILTER_MODEL."""
-    provider_name = (os.environ.get("YT_SEMANTIC_FILTER_PROVIDER") or "ollama").lower()
-    model = os.environ.get("YT_SEMANTIC_FILTER_MODEL", "gemma2")
+    """Build semantic-filter provider from LLM_PROVIDER/LLM_MODEL environment."""
+    provider_name = (os.environ.get("LLM_PROVIDER") or "ollama").lower()
+    model = os.environ.get("LLM_MODEL") or "gemma2"
 
     if provider_name == "ollama":
         base_url = os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
         return OllamaProvider(model=model, base_url=base_url)
     if provider_name == "bedrock":
-        return BedrockProvider(model=model)
+        region = os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+        return BedrockProvider(model=model, region=region)
     raise ValueError(
-        f"Unknown YT_SEMANTIC_FILTER_PROVIDER: {provider_name}. Use 'ollama' or 'bedrock'."
+        f"Unknown LLM_PROVIDER: {provider_name}. Use 'ollama' or 'bedrock'."
     )
 
 
 def _parse_semantic_filter_response(raw: str, video_ids: List[str]) -> Dict[str, dict]:
-    """
-    Parse LLM classification response. Returns dict mapping video_id -> {is_relevant, reason, confidence}.
-    Fails closed: malformed or missing entries are treated as not relevant.
-    """
+    """Parse classification response into {video_id: decision}."""
     result: Dict[str, dict] = {}
     text = raw.strip()
     if "```" in text:
@@ -324,13 +305,7 @@ def filter_videos_by_public_health_relevance(
     min_confidence: float = 0.5,
     verbose: bool = True,
 ) -> List[dict]:
-    """
-    Filter candidate videos by semantic relevance to public health.
-
-    Uses an LLM to classify each video's title (and optionally description).
-    Returns only metadata for videos classified as relevant with sufficient confidence.
-    Fails closed: malformed responses or parse errors exclude the affected videos.
-    """
+    """Keep only public-health-relevant videos from LLM output."""
     if not video_metadata:
         return []
 
@@ -351,18 +326,9 @@ def filter_videos_by_public_health_relevance(
         user_prompt = (
             "Classify each video for public health relevance. Return a JSON array.\n\n"
         )
-        user_prompt = (
-            "Classify each video for public health relevance. Return a JSON array.\n\n"
-        )
         for j, (vid, title, desc) in enumerate(zip(batch_ids, titles, descriptions)):
             user_prompt += f"{j + 1}. video_id: {vid}\n   title: {title}\n"
-            user_prompt += f"{j + 1}. video_id: {vid}\n   title: {title}\n"
             if desc:
-                user_prompt += (
-                    f"   description: {desc[:150]}...\n"
-                    if len(desc) > 150
-                    else f"   description: {desc}\n"
-                )
                 user_prompt += (
                     f"   description: {desc[:150]}...\n"
                     if len(desc) > 150
@@ -389,9 +355,6 @@ def filter_videos_by_public_health_relevance(
                     reason = (
                         c.get("reason", "no classification") if c else "parse skipped"
                     )
-                    reason = (
-                        c.get("reason", "no classification") if c else "parse skipped"
-                    )
                     print(f"  [filtered] {vid}: {reason[:80]}")
         except Exception as e:
             if verbose:
@@ -411,11 +374,7 @@ def _fetch_candidate_video_ids(
     max_search_pages: int = 10,
     verbose: bool = True,
 ) -> List[str]:
-    """Fetch candidate video IDs by fanning out across multiple search queries.
-
-    Each query is independently paginated.  Results are deduplicated so
-    overlapping queries don't inflate the candidate set.
-    """
+    """Fetch candidate video IDs across query fan-out."""
     six_months_ago = (datetime.now(timezone.utc) - timedelta(days=180)).strftime(
         "%Y-%m-%dT00:00:00Z"
     )
@@ -479,11 +438,7 @@ def _filter_by_impact(
     percentile: float = 0.75,
     verbose: bool = False,
 ) -> List[str]:
-    """Compute impact features, filter by engagement thresholds, return top percentile video IDs.
-
-    Raw minimums (views, likes, comments) block small-sample false positives: per-1k
-    ratios alone can look strong on very low view/engagement counts.
-    """
+    """Filter by engagement and return top-percentile IDs."""
     impact_metrics = [_compute_impact_features(v) for v in video_metadata]
     n = len(impact_metrics)
     raw_excluded = sum(
@@ -520,7 +475,7 @@ _ISO_DURATION_RE = re.compile(r"P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?"
 
 
 def _parse_iso8601_duration(raw: str) -> Optional[int]:
-    """Parse an ISO 8601 duration like PT1H2M10S into total seconds."""
+    """Parse ISO-8601 duration into seconds."""
     m = _ISO_DURATION_RE.match(raw or "")
     if not m:
         return None
@@ -529,7 +484,7 @@ def _parse_iso8601_duration(raw: str) -> Optional[int]:
 
 
 def _build_video_row(item: dict) -> dict:
-    """Map a YouTube videos.list item to a dict matching the Video SQLModel."""
+    """Map a videos.list item to a DB row payload."""
     snippet = item.get("snippet", {})
     stats = item.get("statistics", {})
     content = item.get("contentDetails", {})
@@ -554,7 +509,7 @@ def _build_video_row(item: dict) -> dict:
 def _upsert_videos(
     sb, video_metadata: List[dict], filtered_ids: List[str], *, verbose: bool = True
 ) -> int:
-    """Build Video rows for filtered IDs and upsert into Supabase."""
+    """Build video rows and upsert by `video_id`."""
     by_id = {v["id"]: v for v in video_metadata}
     rows = [_build_video_row(by_id[vid]) for vid in filtered_ids if vid in by_id]
     if not rows:
@@ -569,11 +524,7 @@ _ytt_api = YouTubeTranscriptApi()
 
 
 def _save_transcripts(sb, video_ids: List[str], *, verbose: bool = True) -> int:
-    """Fetch transcripts, clean, and persist to Supabase. Returns count saved.
-
-    Skips videos that already have a transcript row (avoids FK conflicts
-    when claims reference the existing transcript_id).
-    """
+    """Fetch, clean, and insert transcripts. Return saved count."""
     existing = (
         sb.table("transcripts").select("video_id").in_("video_id", video_ids).execute()
     )
@@ -626,25 +577,7 @@ def run_youtube_data_ingestion_pipeline(
     quota_budget: Optional[int] = None,
     verbose: bool = True,
 ) -> dict:
-    """
-    Main entrypoint for the YouTube data ingestion pipeline.
-
-    Coordinates the full workflow: search for videos, fetch metadata,
-    filter by semantic relevance and impact, then persist videos and
-    transcripts to Supabase.
-
-    Args:
-        search_queries: List of search terms to fan out across.
-            Defaults to _DEFAULT_SEARCH_QUERIES (~10 public-health terms).
-        min_like_count / min_comment_count: Raw engagement floors for the impact
-            gate (with min_views), avoiding high per-1k ratios on tiny samples.
-        quota_budget: Max YouTube API quota units this run may consume.
-            Defaults to env var YT_QUOTA_DAILY_BUDGET_UNITS or 9000.
-
-    Returns:
-        dict with keys: video_ids, videos_upserted, transcripts_saved,
-        quota_used, quota_budget, quota_breached
-    """
+    """Run ingestion and return IDs, write counts, and quota metrics."""
     load_dotenv()
     api_key = os.getenv("YOUTUBE_DATA_API_KEY")
     if not api_key:
@@ -724,6 +657,45 @@ def run_youtube_data_ingestion_pipeline(
         "quota_budget": budget.budget,
         "quota_breached": budget.breached,
     }
+
+
+def handler(event, context):
+    """
+    AWS Lambda entrypoint for YouTube data ingestion.
+
+    `event` may optionally provide a subset of the run_youtube_data_ingestion_pipeline
+    keyword arguments; any missing keys fall back to existing defaults.
+    """
+    del context  # unused
+
+    event = event or {}
+    if not isinstance(event, dict):
+        raise TypeError("event must be a dict or None")
+
+    kwargs = {}
+    if "search_queries" in event:
+        kwargs["search_queries"] = event["search_queries"]
+    if "max_search_pages" in event:
+        kwargs["max_search_pages"] = int(event["max_search_pages"])
+    if "min_comments_per_1k" in event:
+        kwargs["min_comments_per_1k"] = float(event["min_comments_per_1k"])
+    if "min_likes_per_1k" in event:
+        kwargs["min_likes_per_1k"] = float(event["min_likes_per_1k"])
+    if "min_views" in event:
+        kwargs["min_views"] = int(event["min_views"])
+    if "min_like_count" in event:
+        kwargs["min_like_count"] = int(event["min_like_count"])
+    if "min_comment_count" in event:
+        kwargs["min_comment_count"] = int(event["min_comment_count"])
+    if "percentile" in event:
+        kwargs["percentile"] = float(event["percentile"])
+    if "quota_budget" in event:
+        kwargs["quota_budget"] = int(event["quota_budget"])
+    if "verbose" in event:
+        kwargs["verbose"] = bool(event["verbose"])
+
+    result = run_youtube_data_ingestion_pipeline(**kwargs)
+    return {"ok": True, **result}
 
 
 if __name__ == "__main__":
