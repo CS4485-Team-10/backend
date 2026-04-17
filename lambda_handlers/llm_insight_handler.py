@@ -11,7 +11,7 @@ def lambda_handler(event, context):
     """Lambda handler for LLM insight generation."""
     try:
         logger.info("Starting LLM insight generation pipeline")
-        
+
         # Pass lambda context for time management
         result = run_llm_insight_generation_pipeline(
             lambda_context=context,

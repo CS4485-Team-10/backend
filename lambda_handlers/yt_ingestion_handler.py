@@ -19,7 +19,9 @@ def lambda_handler(event, context):
         max_search_pages = body.get("max_search_pages", 1)
         verbose = body.get("verbose", True)
 
-        logger.info(f"Starting YouTube ingestion with max_search_pages={max_search_pages}")
+        logger.info(
+            f"Starting YouTube ingestion with max_search_pages={max_search_pages}"
+        )
         result = run_youtube_data_ingestion_pipeline(
             max_search_pages=max_search_pages,
             verbose=verbose,
