@@ -2,10 +2,18 @@ FROM public.ecr.aws/lambda/python:3.12
 
 WORKDIR ${LAMBDA_TASK_ROOT}
 
+# Install dependencies
 COPY requirements-yt.txt .
 RUN pip install --no-cache-dir -r requirements-yt.txt
 
-COPY pipelines ./pipelines
-COPY lambda_handlers ./lambda_handlers
+# Copy pipeline code
+COPY pipelines/yt_data_ingestion.py ./pipelines/
+COPY pipelines/shared/ ./pipelines/shared/
+
+# Copy lambda handler
+COPY lambda_handlers/yt_ingestion_handler.py ./lambda_handlers/
+
+# Create __init__.py files for proper imports
+RUN touch pipelines/__init__.py lambda_handlers/__init__.py
 
 CMD ["lambda_handlers.yt_ingestion_handler.lambda_handler"]
