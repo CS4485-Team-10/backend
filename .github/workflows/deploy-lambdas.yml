@@ -1,0 +1,83 @@
+name: Deploy pipeline Lambdas
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pipelines/**"
+      - "Dockerfiles/**"
+      - ".github/workflows/deploy-lambdas.yml"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lambda_name: yt-data-ingestion-lambda
+            ecr_repo: yt-data-ingestion
+            dockerfile: Dockerfiles/yt_data_ingestion.Dockerfile
+
+          - lambda_name: sentiment-analysis-lambda
+            ecr_repo: sentiment-analysis
+            dockerfile: Dockerfiles/sentiment_analysis.Dockerfile
+
+          - lambda_name: misinfo-checker-lambda
+            ecr_repo: misinfo-checker
+            dockerfile: Dockerfiles/misinfo_checker.Dockerfile
+
+          - lambda_name: llm-insight-generation-lambda
+            ecr_repo: llm-insight-generation
+            dockerfile: Dockerfiles/llm_insight_generation.Dockerfile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image URI
+        id: vars
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          IMAGE_TAG=${GITHUB_SHA}
+          IMAGE_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ matrix.ecr_repo }}:${IMAGE_TAG}
+
+          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+
+      - name: Build image
+        run: |
+          docker build \
+            -f "${{ matrix.dockerfile }}" \
+            -t "${{ steps.vars.outputs.image_uri }}" \
+            .
+
+      - name: Push image
+        run: |
+          docker push "${{ steps.vars.outputs.image_uri }}"
+
+      - name: Update Lambda function to new image
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ matrix.lambda_name }}" \
+            --image-uri "${{ steps.vars.outputs.image_uri }}"
+
+      - name: Wait for update
+        run: |
+          aws lambda wait function-updated \
+            --function-name "${{ matrix.lambda_name }}"

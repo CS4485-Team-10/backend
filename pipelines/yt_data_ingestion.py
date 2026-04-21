@@ -355,7 +355,7 @@ def filter_videos_by_public_health_relevance(
                     reason = (
                         c.get("reason", "no classification") if c else "parse skipped"
                     )
-                    print(f"  [filtered] {vid}: {reason[:80]}")
+                    print(f"  [filtered] {vid}: {reason}")
         except Exception as e:
             if verbose:
                 print(f"  [semantic filter batch error] {e}")
