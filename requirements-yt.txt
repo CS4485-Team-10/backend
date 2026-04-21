@@ -1,0 +1,6 @@
+python-dotenv
+google-api-python-client
+youtube-transcript-api
+supabase
+requests
+boto3

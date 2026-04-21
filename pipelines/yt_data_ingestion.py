@@ -237,9 +237,11 @@ def _get_llm_provider_for_filtering() -> LLMProvider:
     model = os.environ.get("LLM_MODEL") or "gemma2"
 
     if provider_name == "ollama":
-        return OllamaProvider(model=model)
+        base_url = os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
+        return OllamaProvider(model=model, base_url=base_url)
     if provider_name == "bedrock":
-        return BedrockProvider(model=model)
+        region = os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+        return BedrockProvider(model=model, region=region)
     raise ValueError(
         f"Unknown LLM_PROVIDER: {provider_name}. Use 'ollama' or 'bedrock'."
     )

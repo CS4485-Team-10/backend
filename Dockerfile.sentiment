@@ -1,0 +1,19 @@
+FROM public.ecr.aws/lambda/python:3.12
+
+WORKDIR ${LAMBDA_TASK_ROOT}
+
+# Install dependencies
+COPY requirements-sentiment.txt .
+RUN pip install --no-cache-dir -r requirements-sentiment.txt
+
+# Copy pipeline code
+COPY pipelines/sentiment_analysis.py ./pipelines/
+COPY pipelines/shared/ ./pipelines/shared/
+
+# Copy lambda handler
+COPY lambda_handlers/sentiment_handler.py ./lambda_handlers/
+
+# Create __init__.py files for proper imports
+RUN touch pipelines/__init__.py lambda_handlers/__init__.py
+
+CMD ["lambda_handlers.sentiment_handler.lambda_handler"]

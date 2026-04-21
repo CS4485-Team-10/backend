@@ -26,6 +26,7 @@ GOOGLE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 SUPABASE_TABLE_VIDEOS = "videos"
+SUPABASE_TABLE_CLAIMS = "claims"
 
 FACT_CHECK_API_URL = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
 
@@ -509,16 +510,33 @@ def _calculate_claim_risk_level(
     entailment_label: str,
     entailment_confidence: float,
 ) -> str:
+    """
+    Calculate risk level based on fact-check results and entailment analysis.
+
+    Strategy:
+    - HIGH: Verified false by fact-checkers OR strongly contradicts medical consensus
+    - MEDIUM: Contradicts medical consensus (lower confidence)
+    - LOW: Aligned with or neutral to medical consensus (default safe state)
+
+    Note: Claims without fact-check results (pending/unverifiable) default to LOW
+    if they don't contradict medical science, rather than assuming medium risk.
+    """
+    # HIGH RISK: Verified false by fact-checkers
     if fact_check_status == "verified_false":
         return "high"
+
+    # HIGH RISK: High-confidence contradiction of medical consensus
     if entailment_label == "refuted" and entailment_confidence >= 0.75:
         return "high"
-    if (
-        fact_check_status in {"unverifiable", "pending"}
-        or fact_check_confidence == "low"
-        or entailment_label == "refuted"
-    ):
+
+    # MEDIUM RISK: Contradicts medical consensus (lower confidence)
+    if entailment_label == "refuted":
         return "medium"
+
+    # LOW RISK: Supported or neutral claims (default safe state)
+    # Even if fact_check_status is "pending"/"unverifiable", if the entailment
+    # check says it's aligned with science ("supported") or is neutral opinion,
+    # it's low risk by default.
     return "low"
 
 
@@ -620,9 +638,10 @@ def ids_from_supabase() -> list[str]:
 
 
 def ids_from_supabase_with_incomplete_claims(limit: int = 1000) -> list[str]:
+    """Find videos that have claims with any NULL enrichment fields."""
     client = get_supabase_client()
     rows = (
-        client.table("claims")
+        client.table(SUPABASE_TABLE_CLAIMS)
         .select("video_id")
         .or_(
             "sentiment_label.is.null,"
@@ -637,6 +656,37 @@ def ids_from_supabase_with_incomplete_claims(limit: int = 1000) -> list[str]:
     video_ids = sorted({str(r["video_id"]) for r in rows.data})
     print(f"  Found {len(video_ids)} video(s) with incomplete claim enrichment")
     return video_ids
+
+
+def ids_from_supabase_without_factcheck() -> list[str]:
+    """
+    Find videos that have claims but those claims haven't been
+    fact-checked yet (fact_check_status is NULL). This is more targeted
+    than ids_from_supabase_with_incomplete_claims() which checks all fields.
+    """
+    client = get_supabase_client()
+
+    # Get all videos that have claims
+    all_claims = client.table(SUPABASE_TABLE_CLAIMS).select("video_id").execute()
+    videos_with_claims = set(r["video_id"] for r in all_claims.data)
+
+    # Get videos where claims have been fact-checked (fact_check_status is NOT NULL)
+    checked_claims = (
+        client.table(SUPABASE_TABLE_CLAIMS)
+        .select("video_id")
+        .not_.is_("fact_check_status", "null")
+        .execute()
+    )
+    videos_already_checked = set(r["video_id"] for r in checked_claims.data)
+
+    # Videos needing fact-check = have claims but none are checked
+    remaining = sorted(list(videos_with_claims - videos_already_checked))
+    print(
+        f"  {len(videos_with_claims)} videos with claims, "
+        f"{len(videos_already_checked)} already fact-checked, "
+        f"{len(remaining)} remaining"
+    )
+    return remaining
 
 
 RISK_ICONS = {"low": "[LOW]", "medium": "[MED]", "high": "[HIGH]"}
@@ -856,7 +906,7 @@ if __name__ == "__main__":
         elif mode == "2":
             video_ids = ids_from_supabase()
         elif mode == "3":
-            video_ids = ids_from_supabase_with_incomplete_claims()
+            video_ids = ids_from_supabase_without_factcheck()
         else:
             print(
                 f"Unknown mode '{mode}'. Use: no args | 1 <file> | 2 | 3 | --video <ID>"
