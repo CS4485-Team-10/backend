@@ -371,11 +371,11 @@ def _fetch_candidate_video_ids(
     budget: QuotaBudget,
     *,
     search_queries: List[str] = _DEFAULT_SEARCH_QUERIES,
-    max_search_pages: int = 10,
+    max_search_pages: int = 5,
     verbose: bool = True,
 ) -> List[str]:
     """Fetch candidate video IDs across query fan-out."""
-    six_months_ago = (datetime.now(timezone.utc) - timedelta(days=180)).strftime(
+    target_timeframe = (datetime.now(timezone.utc) - timedelta(days=90)).strftime(
         "%Y-%m-%dT00:00:00Z"
     )
 
@@ -402,7 +402,7 @@ def _fetch_candidate_video_ids(
                         part="snippet",
                         type="video",
                         maxResults=50,
-                        publishedAfter=six_months_ago,
+                        publishedAfter=target_timeframe,
                         order="viewCount",
                         relevanceLanguage="en",
                         pageToken=page_token,
@@ -435,7 +435,7 @@ def _filter_by_impact(
     min_views: int = 500,
     min_like_count: int = 25,
     min_comment_count: int = 5,
-    percentile: float = 0.75,
+    percentile: float = 0.50,
     verbose: bool = False,
 ) -> List[str]:
     """Filter by engagement and return top-percentile IDs."""
@@ -567,17 +567,20 @@ def _save_transcripts(sb, video_ids: List[str], *, verbose: bool = True) -> int:
 def run_youtube_data_ingestion_pipeline(
     *,
     search_queries: Optional[List[str]] = None,
-    max_search_pages: int = 10,
+    max_search_pages: int = 3,
     min_comments_per_1k: float = 1.0,
     min_likes_per_1k: float = 10,
-    min_views: int = 500,
-    min_like_count: int = 25,
-    min_comment_count: int = 5,
-    percentile: float = 0.75,
+    min_views: int = 1500,
+    min_like_count: int = 50,
+    min_comment_count: int = 10,
+    percentile: float = 0.5,
     quota_budget: Optional[int] = None,
     verbose: bool = True,
 ) -> dict:
-    """Run ingestion and return IDs, write counts, and quota metrics."""
+    """Run ingestion and return IDs, write counts, and quota metrics.
+
+    Order: search → videos.list metadata → impact filter → LLM semantic filter → upsert + transcripts.
+    """
     load_dotenv()
     api_key = os.getenv("YOUTUBE_DATA_API_KEY")
     if not api_key:
@@ -614,16 +617,11 @@ def run_youtube_data_ingestion_pipeline(
 
     if not budget.breached:
         video_metadata = _fetch_video_metadata(youtube, video_ids, budget)
-        video_metadata = filter_videos_by_public_health_relevance(
-            video_metadata, verbose=verbose
-        )
         if verbose:
-            print(
-                f"After semantic filter: {len(video_metadata)} public-health-relevant"
-            )
+            print(f"Fetched metadata for {len(video_metadata)} videos")
 
-    if not budget.breached:
-        filtered_ids = _filter_by_impact(
+    if not budget.breached and video_metadata:
+        impact_ids = _filter_by_impact(
             video_metadata,
             min_comments_per_1k=min_comments_per_1k,
             min_likes_per_1k=min_likes_per_1k,
@@ -634,7 +632,21 @@ def run_youtube_data_ingestion_pipeline(
             verbose=verbose,
         )
         if verbose:
-            print(f"After impact filter: {len(filtered_ids)} high-impact")
+            print(f"After impact filter: {len(impact_ids)} high-impact")
+        by_vid = {v["id"]: v for v in video_metadata}
+        video_metadata = [by_vid[i] for i in impact_ids if i in by_vid]
+
+    if not budget.breached and video_metadata:
+        video_metadata = filter_videos_by_public_health_relevance(
+            video_metadata, verbose=verbose
+        )
+        if verbose:
+            print(
+                f"After semantic filter: {len(video_metadata)} public-health-relevant"
+            )
+
+    if not budget.breached:
+        filtered_ids = [v["id"] for v in video_metadata]
 
     if not budget.breached and filtered_ids:
         videos_upserted = _upsert_videos(
