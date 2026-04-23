@@ -1,11 +1,15 @@
 """Fetch YouTube metadata/transcripts and store videos + transcripts."""
 
+import hashlib
 import json
 import math
 import os
+import random
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 from dotenv import load_dotenv
@@ -13,8 +17,43 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from supabase import create_client
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import WebshareProxyConfig
+from youtube_transcript_api._errors import (
+    CouldNotRetrieveTranscript,
+    IpBlocked,
+    NoTranscriptFound,
+    RequestBlocked,
+)
 
 from pipelines.shared import BedrockProvider, LLMProvider, OllamaProvider
+
+# region agent log
+_AGENT_LOG_PATH = Path(
+    "/Users/advaychandramouli/dev/projects/youtube-intelligence-platform/backend/.cursor/"
+    "debug-66acb4.log"
+)
+_AGENT_DEBUG_SESSION = "66acb4"
+
+
+def _agent_debug_log(
+    hypothesis_id: str, message: str, data: dict, *, run_id: str = "pre-fix"
+) -> None:
+    try:
+        payload: dict = {
+            "sessionId": _AGENT_DEBUG_SESSION,
+            "runId": run_id,
+            "timestamp": int(time.time() * 1000),
+            "hypothesisId": hypothesis_id,
+            "message": message,
+            "data": data,
+        }
+        with _AGENT_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except OSError:
+        pass
+
+
+# endregion
 
 # YouTube Data API v3 quota unit costs per request.
 # Source: https://developers.google.com/youtube/v3/determine_quota_cost
@@ -23,7 +62,6 @@ _QUOTA_COST_VIDEOS_LIST = 1
 
 _DEFAULT_QUOTA_BUDGET = 9000  # keep a 1000-unit buffer under the 10,000/day default
 
-# Tuned for ~300+ deduplicated candidate IDs with 6-month window and default pagination.
 _DEFAULT_SEARCH_QUERIES = [
     "personal mental health",
     "personal fitness health journey",
@@ -198,7 +236,7 @@ def _clean_transcript(transcript_data: Union[List[Dict], str]) -> str:
     return text
 
 
-_SEMANTIC_FILTER_SYSTEM = """You classify YouTube videos for relevance to PUBLIC HEALTH.
+_SEMANTIC_FILTER_SYSTEM = """You classify YouTube videos for relevance to GENERALIZABLE HEALTH INFORMATION.
 
 PUBLIC HEALTH includes:
 - Population-level health topics (disease, prevention, epidemiology)
@@ -216,14 +254,31 @@ STRICTLY EXCLUDE:
 - Vague wellness claims without clear mechanism or evidence
 - Non-health content (e.g., hobbies, possessions, general life updates)
 
-IMPORTANT:
-A video is ONLY relevant if the content is GENERALIZABLE and provides information useful beyond a single individual.
+IMPORTANT RETRIEVAL CONTEXT:
+These videos were retrieved using health-related search queries. Treat alignment with the search intent as positive evidence of relevance.
+If a video is about a health-related topic represented by the query context — such as sleep, pregnancy, nutrition, exercise, chronic illness, preventive health, or mental health — it should generally be considered relevant IF the content appears generalizable, educational, explanatory, or broadly informative.
+Do NOT require the video to explicitly mention "public health" or be framed at a population-policy level.
+
+However, query alignment alone is NOT sufficient. Still exclude videos that are primarily:
+- personal anecdotes or vlogs
+- motivational/self-help content
+- celebrity/news gossip
+- relationship/lifestyle drama
+- highly individual situations without broader educational value
+- health topics mentioned only incidentally
+
+You must also decide whether the video is ENGLISH / ENGLISH-USABLE for transcript
+and downstream claim extraction. Set "is_english_usable" = true if the title and
+description suggest the spoken content is primarily English (a few non-English
+hashtags, loanwords, or emoji are fine). Set it to false if the content appears
+to be primarily in another language.
 
 Return ONLY valid JSON in this format:
 [
   {
     "video_id": "...",
     "is_relevant": true | false,
+    "is_english_usable": true | false,
     "reason": "short explanation",
     "confidence": 0.0-1.0
   }
@@ -234,7 +289,7 @@ Return ONLY valid JSON in this format:
 def _get_llm_provider_for_filtering() -> LLMProvider:
     """Build semantic-filter provider from LLM_PROVIDER/LLM_MODEL environment."""
     provider_name = (os.environ.get("LLM_PROVIDER") or "ollama").lower()
-    model = os.environ.get("LLM_MODEL") or "gemma2"
+    model = os.environ.get("INGEST_LLM_MODEL") or "gemma2"
 
     if provider_name == "ollama":
         return OllamaProvider(model=model)
@@ -243,6 +298,24 @@ def _get_llm_provider_for_filtering() -> LLMProvider:
     raise ValueError(
         f"Unknown LLM_PROVIDER: {provider_name}. Use 'ollama' or 'bedrock'."
     )
+
+def _parse_json_from_llm_text(text: str) -> Optional[object]:
+    """Parse JSON from model output; tolerate leading/trailing prose (e.g. 'Here is…' before `[`)."""
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    for open_ch, close_ch in (("[", "]"), ("{", "}")):
+        start = text.find(open_ch)
+        end = text.rfind(close_ch)
+        if start != -1 and end > start:
+            snippet = text[start : end + 1]
+            try:
+                return json.loads(snippet)
+            except json.JSONDecodeError:
+                continue
+    return None
 
 
 def _parse_semantic_filter_response(raw: str, video_ids: List[str]) -> Dict[str, dict]:
@@ -256,9 +329,38 @@ def _parse_semantic_filter_response(raw: str, video_ids: List[str]) -> Dict[str,
                 end = text.find("```", start)
                 text = text[start : end if end >= 0 else None].strip()
                 break
+    expected = set(video_ids)
+    err_first: Optional[BaseException] = None
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        err_first = e
+        parsed = _parse_json_from_llm_text(text)
+        if parsed is not None:
+            # region agent log
+            _agent_debug_log(
+                "H1",
+                "json_recovered_after_preamble_strip",
+                {
+                    "text_len": len(text),
+                    "parsed_type": type(parsed).__name__,
+                    "first_error": str(e)[:200],
+                },
+                run_id="post-fix",
+            )
+            # endregion
+    if parsed is None:
+        # region agent log
+        _agent_debug_log(
+            "H1",
+            "json_loads_failed",
+            {
+                "error": str(err_first)[:200] if err_first else "unknown",
+                "text_len": len(text),
+                "text_head_400": text[:400],
+            },
+        )
+        # endregion
         return result
 
     items = (
@@ -266,13 +368,50 @@ def _parse_semantic_filter_response(raw: str, video_ids: List[str]) -> Dict[str,
         if isinstance(parsed, list)
         else parsed.get("results", parsed.get("items", []))
     )
-    items = (
-        parsed
-        if isinstance(parsed, list)
-        else parsed.get("results", parsed.get("items", []))
-    )
     if not isinstance(items, list):
+        # region agent log
+        _agent_debug_log(
+            "H2",
+            "items_not_list",
+            {
+                "parsed_type": type(parsed).__name__,
+                "parsed_dict_keys": list(parsed.keys())
+                if isinstance(parsed, dict)
+                else None,
+                "items_rejected_type": type(items).__name__,
+            },
+        )
+        # endregion
         return result
+
+    def _coerce_bool(value, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        return str(value).lower() in ("true", "1", "yes")
+
+    # region agent log
+    non_dict = 0
+    mismatch: List[dict] = []
+    first_item_keys: Optional[List[str]] = None
+    for item in items:
+        if not isinstance(item, dict):
+            non_dict += 1
+            continue
+        if first_item_keys is None:
+            first_item_keys = list(item.keys())
+        raw_id = item.get("video_id", item.get("videoId"))
+        cand = raw_id if raw_id is None else str(raw_id).strip()
+        if cand and cand not in video_ids and raw_id is not None:
+            mismatch.append(
+                {
+                    "raw_video_id": repr(raw_id)[:120],
+                    "coerced": repr(cand)[:120],
+                    "in_batch": cand in expected,
+                }
+            )
+    # endregion
 
     for item in items:
         if not isinstance(item, dict):
@@ -280,18 +419,46 @@ def _parse_semantic_filter_response(raw: str, video_ids: List[str]) -> Dict[str,
         vid = item.get("video_id")
         if not vid or vid not in video_ids:
             continue
-        is_rel = item.get("is_relevant", False)
-        if not isinstance(is_rel, bool):
-            is_rel = str(is_rel).lower() in ("true", "1", "yes")
+        is_rel = _coerce_bool(item.get("is_relevant"), False)
+        # Fail closed for language: missing field => not English-usable.
+        is_english_usable = _coerce_bool(item.get("is_english_usable"), False)
         try:
             conf = float(item.get("confidence", 0.0))
         except (TypeError, ValueError):
             conf = 0.0
         result[vid] = {
             "is_relevant": is_rel,
+            "is_english_usable": is_english_usable,
             "reason": str(item.get("reason", ""))[:200],
             "confidence": conf,
         }
+
+    # region agent log
+    missing = list(expected - set(result.keys()))
+    llm_ids_seen: List[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for k in ("video_id", "videoId"):
+            if k in item and item[k] is not None:
+                llm_ids_seen.append(str(item[k])[:20])
+                break
+    _agent_debug_log(
+        "H3",
+        "parse_outcome",
+        {
+            "n_expected": len(expected),
+            "n_items": len(items),
+            "n_result": len(result),
+            "n_non_dict_items": non_dict,
+            "missing_count": len(missing),
+            "missing_ids_sample": missing[:30],
+            "first_item_keys": first_item_keys,
+            "mismatch_guess": mismatch[:20],
+            "llm_id_samples": llm_ids_seen[:25],
+        },
+    )
+    # endregion
     return result
 
 
@@ -310,6 +477,27 @@ def filter_videos_by_public_health_relevance(
     prov = provider or _get_llm_provider_for_filtering()
     kept: List[dict] = []
     video_by_id = {v["id"]: v for v in video_metadata}
+
+    # region agent log
+    all_ids_order = [v["id"] for v in video_metadata]
+    all_titles = {
+        v["id"]: (v.get("snippet") or {}).get("title", "")[:200] or "(no title)"
+        for v in video_metadata
+    }
+    id_fp = hashlib.md5(
+        json.dumps(all_ids_order, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()[:16]
+    _agent_debug_log(
+        "H4",
+        "semantic_filter_cohort",
+        {
+            "n_videos": len(all_ids_order),
+            "ids_fingerprint": id_fp,
+            "ids_in_order": all_ids_order,
+            "title_by_id": all_titles,
+        },
+    )
+    # endregion
 
     for i in range(0, len(video_metadata), batch_size):
         batch = video_metadata[i : i + batch_size]
@@ -334,25 +522,53 @@ def filter_videos_by_public_health_relevance(
                 )
             user_prompt += "\n"
 
-        user_prompt += '\nReturn JSON array: [{"video_id":"...","is_relevant":bool,"reason":"...","confidence":0.0-1.0}, ...]'
+        user_prompt += '\nReturn JSON array: [{"video_id":"...","is_relevant":bool,"is_english_usable":bool,"reason":"...","confidence":0.0-1.0}, ...]'
+
+        # region agent log
+        _agent_debug_log(
+            "H5",
+            "semantic_filter_batch",
+            {
+                "batch_index": i // batch_size,
+                "batch_size": len(batch_ids),
+                "batch_ids": batch_ids,
+                "batch_titles": {bid: all_titles.get(bid, "") for bid in batch_ids},
+            },
+        )
+        # endregion
 
         try:
             raw = prov.generate_response(
                 system=_SEMANTIC_FILTER_SYSTEM, user_prompt=user_prompt
             )
+            # region agent log
+            _agent_debug_log(
+                "H5",
+                "llm_response_stats",
+                {
+                    "batch_index": i // batch_size,
+                    "raw_len": len(raw or ""),
+                    "raw_head_300": (raw or "")[:300],
+                },
+            )
+            # endregion
             classifications = _parse_semantic_filter_response(raw, batch_ids)
             for vid in batch_ids:
                 c = classifications.get(vid)
                 if (
                     c
                     and c.get("is_relevant")
+                    and c.get("is_english_usable")
                     and c.get("confidence", 0) >= min_confidence
                 ):
                     kept.append(video_by_id[vid])
                 elif verbose:
-                    reason = (
-                        c.get("reason", "no classification") if c else "parse skipped"
-                    )
+                    if not c:
+                        reason = "parse skipped"
+                    elif not c.get("is_english_usable"):
+                        reason = "not English-usable"
+                    else:
+                        reason = c.get("reason", "no classification")
                     print(f"  [filtered] {vid}: {reason}")
         except Exception as e:
             if verbose:
@@ -481,6 +697,116 @@ def _parse_iso8601_duration(raw: str) -> Optional[int]:
     return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
+def _filter_by_min_duration(
+    video_metadata: List[dict],
+    *,
+    min_duration_seconds: int,
+    verbose: bool = True,
+) -> List[dict]:
+    """Drop videos shorter than ``min_duration_seconds`` (Shorts-style content).
+
+    Unparseable or zero-second durations are treated as failing the gate to
+    avoid wasting downstream compute on edge/Shorts metadata.
+    """
+    if min_duration_seconds <= 0:
+        return video_metadata
+
+    kept: List[dict] = []
+    excluded = 0
+    for item in video_metadata:
+        raw = (item.get("contentDetails") or {}).get("duration")
+        seconds = _parse_iso8601_duration(raw) or 0
+        if seconds >= min_duration_seconds:
+            kept.append(item)
+        else:
+            excluded += 1
+    if verbose:
+        print(
+            f"  [duration] excluded {excluded}/{len(video_metadata)} videos "
+            f"shorter than {min_duration_seconds}s"
+        )
+    return kept
+
+
+# Unicode script ranges for cheap non-Latin detection on title/description.
+_NON_LATIN_RANGES = (
+    (0x0400, 0x04FF),  # Cyrillic
+    (0x0500, 0x052F),  # Cyrillic Supplement
+    (0x0590, 0x05FF),  # Hebrew
+    (0x0600, 0x06FF),  # Arabic
+    (0x0700, 0x074F),  # Syriac
+    (0x0900, 0x097F),  # Devanagari
+    (0x0980, 0x09FF),  # Bengali
+    (0x0E00, 0x0E7F),  # Thai
+    (0x3040, 0x30FF),  # Hiragana + Katakana
+    (0x3400, 0x4DBF),  # CJK Extension A
+    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
+    (0xAC00, 0xD7AF),  # Hangul Syllables
+)
+
+
+def _is_non_latin_letter(ch: str) -> bool:
+    cp = ord(ch)
+    for lo, hi in _NON_LATIN_RANGES:
+        if lo <= cp <= hi:
+            return True
+    return False
+
+
+def _heuristic_latin_english_plausible(
+    title: str, description: str, *, max_desc_chars: int = 250
+) -> bool:
+    """Cheap deterministic check that title+description look English-plausible.
+
+    Returns False only when non-Latin letters dominate the metadata, so English
+    text with a few hashtags, emoji, or loanwords still passes through.
+    """
+    text = f"{title or ''} {(description or '')[:max_desc_chars]}"
+    latin = 0
+    non_latin = 0
+    for ch in text:
+        if not ch.isalpha():
+            continue
+        if _is_non_latin_letter(ch):
+            non_latin += 1
+        elif ch.isascii() or ch.lower() != ch.upper():
+            latin += 1
+
+    total_letters = latin + non_latin
+    if total_letters < 8:
+        # Too little textual signal; defer to LLM rather than hard-rejecting.
+        return True
+    if non_latin == 0:
+        return True
+    if latin < 10 and non_latin >= 5:
+        return False
+    return (non_latin / total_letters) < 0.4
+
+
+def _filter_by_language_heuristic(
+    video_metadata: List[dict], *, verbose: bool = True
+) -> List[dict]:
+    """Drop videos whose title/description metadata is non-Latin-script-heavy."""
+    kept: List[dict] = []
+    excluded = 0
+    for item in video_metadata:
+        snippet = item.get("snippet", {}) or {}
+        title = snippet.get("title", "") or ""
+        desc = snippet.get("description", "") or ""
+        if _heuristic_latin_english_plausible(title, desc):
+            kept.append(item)
+            continue
+        excluded += 1
+        if verbose:
+            print(f"  [filtered] {item.get('id')}: non-Latin metadata heuristic")
+    if verbose:
+        print(
+            f"  [language-heuristic] excluded {excluded}/{len(video_metadata)} "
+            f"non-Latin-heavy candidates"
+        )
+    return kept
+
+
 def _build_video_row(item: dict) -> dict:
     """Map a videos.list item to a DB row payload."""
     snippet = item.get("snippet", {})
@@ -518,7 +844,58 @@ def _upsert_videos(
     return len(rows)
 
 
-_ytt_api = YouTubeTranscriptApi()
+load_dotenv()
+_ytt_proxy_username = os.getenv("YOUTUBE_TRANSCRIPT_PROXY_USERNAME")
+_ytt_proxy_password = os.getenv("YOUTUBE_TRANSCRIPT_PROXY_PASSWORD")
+if _ytt_proxy_username and _ytt_proxy_password:
+    _ytt_api = YouTubeTranscriptApi(
+        proxy_config=WebshareProxyConfig(
+            proxy_username=_ytt_proxy_username,
+            proxy_password=_ytt_proxy_password,
+        )
+    )
+else:
+    _ytt_api = YouTubeTranscriptApi()
+
+
+def _fetch_transcript_with_fallback(video_id: str):
+    """Return ``(fetched, source)`` for a video or ``(None, reason)``.
+
+    ``source`` is one of: ``"en"`` (direct English track), ``"translated:<code>"``
+    (translated to English from another language), ``"none"`` (no usable track),
+    or ``"blocked"`` (request/IP blocked). The caller logs accordingly.
+    """
+    try:
+        return _ytt_api.fetch(video_id, languages=["en"]), "en"
+    except (RequestBlocked, IpBlocked):
+        return None, "blocked"
+    except NoTranscriptFound:
+        pass
+    except CouldNotRetrieveTranscript:
+        return None, "none"
+
+    try:
+        transcript_list = _ytt_api.list(video_id)
+    except (RequestBlocked, IpBlocked):
+        return None, "blocked"
+    except CouldNotRetrieveTranscript:
+        return None, "none"
+
+    translatable = [t for t in transcript_list if getattr(t, "is_translatable", False)]
+    candidates = translatable or list(transcript_list)
+    for transcript in candidates:
+        try:
+            translated = transcript.translate("en").fetch()
+        except (RequestBlocked, IpBlocked):
+            return None, "blocked"
+        except CouldNotRetrieveTranscript:
+            continue
+        except Exception:
+            continue
+        source_lang = getattr(transcript, "language_code", "") or "?"
+        return translated, f"translated:{source_lang}"
+
+    return None, "none"
 
 
 def _save_transcripts(sb, video_ids: List[str], *, verbose: bool = True) -> int:
@@ -534,11 +911,20 @@ def _save_transcripts(sb, video_ids: List[str], *, verbose: bool = True) -> int:
             if verbose:
                 print(f"Transcript already exists for {video_id}, skipping")
             continue
+        time.sleep(random.uniform(2, 5))
         try:
-            transcript = _ytt_api.fetch(video_id)
+            fetched, source = _fetch_transcript_with_fallback(video_id)
+            if fetched is None:
+                if verbose:
+                    if source == "blocked":
+                        print(f"Transcript blocked (IP/request) for {video_id}")
+                    else:
+                        print(f"No usable transcript for {video_id}")
+                continue
+
             segments = [
                 {"text": s.text, "start": s.start, "duration": s.duration}
-                for s in transcript.snippets
+                for s in fetched.snippets
             ]
             cleaned = _clean_transcript(segments)
 
@@ -553,9 +939,20 @@ def _save_transcripts(sb, video_ids: List[str], *, verbose: bool = True) -> int:
                     "video_id": video_id,
                     "cleaned_transcript_txt": cleaned or "",
                     "created_at": datetime.now(timezone.utc).isoformat(),
+                    "processing_status": "pending",
+                    "attempt_count": 0,
                 }
             ).execute()
             saved += 1
+            if verbose:
+                if source == "en":
+                    print(f"Transcript saved (English direct) for {video_id}")
+                elif source.startswith("translated:"):
+                    src_lang = source.split(":", 1)[1]
+                    print(
+                        f"Transcript saved (translated to English from "
+                        f"{src_lang}) for {video_id}"
+                    )
         except Exception as e:
             if verbose:
                 print(f"No transcript for {video_id}: {e}")
@@ -572,12 +969,15 @@ def run_youtube_data_ingestion_pipeline(
     min_like_count: int = 50,
     min_comment_count: int = 10,
     percentile: float = 0.5,
+    min_duration_seconds: int = 120,
     quota_budget: Optional[int] = None,
     verbose: bool = True,
 ) -> dict:
     """Run ingestion and return IDs, write counts, and quota metrics.
 
-    Order: search → videos.list metadata → impact filter → LLM semantic filter → upsert + transcripts.
+    Order: search → videos.list metadata → duration filter → language heuristic →
+    impact filter → LLM semantic filter (relevance + English-usable) →
+    upsert + transcripts.
     """
     load_dotenv()
     api_key = os.getenv("YOUTUBE_DATA_API_KEY")
@@ -617,6 +1017,20 @@ def run_youtube_data_ingestion_pipeline(
         video_metadata = _fetch_video_metadata(youtube, video_ids, budget)
         if verbose:
             print(f"Fetched metadata for {len(video_metadata)} videos")
+
+    if not budget.breached and video_metadata:
+        video_metadata = _filter_by_min_duration(
+            video_metadata,
+            min_duration_seconds=min_duration_seconds,
+            verbose=verbose,
+        )
+        if verbose:
+            print(f"After duration filter: {len(video_metadata)} videos")
+
+    if not budget.breached and video_metadata:
+        video_metadata = _filter_by_language_heuristic(video_metadata, verbose=verbose)
+        if verbose:
+            print(f"After language heuristic: {len(video_metadata)} videos")
 
     if not budget.breached and video_metadata:
         impact_ids = _filter_by_impact(
@@ -699,6 +1113,8 @@ def handler(event, context):
         kwargs["min_comment_count"] = int(event["min_comment_count"])
     if "percentile" in event:
         kwargs["percentile"] = float(event["percentile"])
+    if "min_duration_seconds" in event:
+        kwargs["min_duration_seconds"] = int(event["min_duration_seconds"])
     if "quota_budget" in event:
         kwargs["quota_budget"] = int(event["quota_budget"])
     if "verbose" in event:
