@@ -72,6 +72,13 @@ _DEFAULT_SEARCH_QUERIES = [
     "preventive health wellness",
 ]
 
+# YouTube search.list `order` allowlist.
+# Source: https://developers.google.com/youtube/v3/docs/search/list#order
+_VALID_SEARCH_ORDERS = {"date", "rating", "relevance", "title", "videoCount", "viewCount"}
+
+# Default multi-pass strategy: one pass for query relevance, one for popularity.
+_DEFAULT_SEARCH_ORDER_PASSES: List[str] = ["relevance", "viewCount"]
+
 
 class QuotaBudget:
     """Track consumed YouTube API quota against a budget."""
@@ -585,60 +592,89 @@ def _fetch_candidate_video_ids(
     budget: QuotaBudget,
     *,
     search_queries: List[str] = _DEFAULT_SEARCH_QUERIES,
-    max_search_pages: int = 5,
+    search_order_passes: List[str] = _DEFAULT_SEARCH_ORDER_PASSES,
+    max_search_pages: int,
     verbose: bool = True,
 ) -> List[str]:
-    """Fetch candidate video IDs across query fan-out."""
+    """Fetch candidate video IDs across query fan-out with multiple sort-order passes.
+
+    Each element of ``search_order_passes`` drives a full sweep over all
+    ``search_queries``.  A single ``seen_ids`` set deduplicates across passes,
+    so IDs found in the relevance pass are not re-counted in the viewCount pass.
+    The returned list preserves insertion order (relevance pass first).
+
+    Two passes (relevance + viewCount) roughly double search quota; the
+    existing QuotaBudget guard stops early on any breach.
+    """
+    invalid = [o for o in search_order_passes if o not in _VALID_SEARCH_ORDERS]
+    if invalid:
+        raise ValueError(
+            f"Invalid search order(s): {invalid!r}. "
+            f"Must be one of {sorted(_VALID_SEARCH_ORDERS)}."
+        )
+
     target_timeframe = (datetime.now(timezone.utc) - timedelta(days=90)).strftime(
         "%Y-%m-%dT00:00:00Z"
     )
 
+    # Insertion-ordered list; seen_ids tracks dedup across all passes.
+    candidate_ids: List[str] = []
     seen_ids: set[str] = set()
 
-    for query in search_queries:
+    for order in search_order_passes:
         if budget.breached:
             break
-
-        query_count = 0
-        page_token = None
-        for page_num in range(max_search_pages):
-            if not budget.try_consume(
-                _QUOTA_COST_SEARCH_LIST,
-                stage="search.list",
-                detail=f"q={query!r} page {page_num + 1}/{max_search_pages}",
-            ):
-                break
-            try:
-                resp = (
-                    youtube.search()
-                    .list(
-                        q=query,
-                        part="snippet",
-                        type="video",
-                        maxResults=50,
-                        publishedAfter=target_timeframe,
-                        order="viewCount",
-                        relevanceLanguage="en",
-                        pageToken=page_token,
-                    )
-                    .execute()
-                )
-            except HttpError as e:
-                _reraise_if_youtube_quota_exceeded(e)
-            for item in resp.get("items", []):
-                vid = item.get("id", {}).get("videoId")
-                if vid and item.get("id", {}).get("kind") == "youtube#video":
-                    if vid not in seen_ids:
-                        seen_ids.add(vid)
-                        query_count += 1
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
-
         if verbose:
-            print(f"  query {query!r}: {query_count} new IDs (total {len(seen_ids)})")
+            print(f"[search] pass order={order!r}")
 
-    return list(seen_ids)
+        for query in search_queries:
+            if budget.breached:
+                break
+
+            query_count = 0
+            page_token = None
+            for page_num in range(max_search_pages):
+                if not budget.try_consume(
+                    _QUOTA_COST_SEARCH_LIST,
+                    stage="search.list",
+                    detail=f"order={order!r} q={query!r} page {page_num + 1}/{max_search_pages}",
+                ):
+                    break
+                try:
+                    resp = (
+                        youtube.search()
+                        .list(
+                            q=query,
+                            part="snippet",
+                            type="video",
+                            maxResults=50,
+                            publishedAfter=target_timeframe,
+                            order=order,
+                            relevanceLanguage="en",
+                            pageToken=page_token,
+                        )
+                        .execute()
+                    )
+                except HttpError as e:
+                    _reraise_if_youtube_quota_exceeded(e)
+                for item in resp.get("items", []):
+                    vid = item.get("id", {}).get("videoId")
+                    if vid and item.get("id", {}).get("kind") == "youtube#video":
+                        if vid not in seen_ids:
+                            seen_ids.add(vid)
+                            candidate_ids.append(vid)
+                            query_count += 1
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+
+            if verbose:
+                print(
+                    f"  [order={order!r}] query {query!r}: "
+                    f"{query_count} new IDs (running total {len(candidate_ids)})"
+                )
+
+    return candidate_ids
 
 
 def _filter_by_impact(
@@ -830,6 +866,30 @@ def _build_video_row(item: dict) -> dict:
     }
 
 
+def _fetch_all_video_ids(sb, *, page_size: int = 1000) -> set[str]:
+    """Return the set of all video_id values already stored in Supabase.
+
+    Paginates with .range() because PostgREST returns at most ``page_size``
+    rows per request (default cap is often 1 000).
+    """
+    known: set[str] = set()
+    offset = 0
+    while True:
+        rows = (
+            sb.table("videos")
+            .select("video_id")
+            .range(offset, offset + page_size - 1)
+            .execute()
+            .data
+        )
+        for r in rows:
+            known.add(r["video_id"])
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return known
+
+
 def _upsert_videos(
     sb, video_metadata: List[dict], filtered_ids: List[str], *, verbose: bool = True
 ) -> int:
@@ -962,22 +1022,35 @@ def _save_transcripts(sb, video_ids: List[str], *, verbose: bool = True) -> int:
 def run_youtube_data_ingestion_pipeline(
     *,
     search_queries: Optional[List[str]] = None,
+    search_order_passes: Optional[List[str]] = None,
+    exclude_existing_video_ids: bool = True,
     max_search_pages: int = 3,
     min_comments_per_1k: float = 1.0,
     min_likes_per_1k: float = 10,
     min_views: int = 1500,
     min_like_count: int = 50,
     min_comment_count: int = 10,
-    percentile: float = 0.5,
+    percentile: float = 0.65,
     min_duration_seconds: int = 120,
     quota_budget: Optional[int] = None,
     verbose: bool = True,
 ) -> dict:
     """Run ingestion and return IDs, write counts, and quota metrics.
 
-    Order: search → videos.list metadata → duration filter → language heuristic →
-    impact filter → LLM semantic filter (relevance + English-usable) →
-    upsert + transcripts.
+    Order: search (multi-pass) → exclude existing DB IDs → videos.list metadata →
+    duration filter → language heuristic → impact filter →
+    LLM semantic filter (relevance + English-usable) → upsert + transcripts.
+
+    Args:
+        search_order_passes: List of YouTube search `order` values to sweep through.
+            Defaults to ["relevance", "viewCount"].  Each pass runs the full
+            search_queries fan-out; IDs found in an earlier pass are skipped in
+            later passes.  Valid values: date, rating, relevance, title,
+            videoCount, viewCount.
+        exclude_existing_video_ids: When True (default), any video_id already
+            present in the `videos` table is removed from the candidate list
+            before videos.list and all downstream quota is spent.  Set to False
+            for local re-runs where re-processing is acceptable.
     """
     load_dotenv()
     api_key = os.getenv("YOUTUBE_DATA_API_KEY")
@@ -998,15 +1071,49 @@ def run_youtube_data_ingestion_pipeline(
     youtube = build(serviceName="youtube", version="v3", developerKey=api_key)
 
     queries = search_queries or _DEFAULT_SEARCH_QUERIES
-    video_ids = _fetch_candidate_video_ids(
+    passes = search_order_passes or _DEFAULT_SEARCH_ORDER_PASSES
+
+    candidate_ids = _fetch_candidate_video_ids(
         youtube,
         budget,
         search_queries=queries,
+        search_order_passes=passes,
         max_search_pages=max_search_pages,
         verbose=verbose,
     )
     if verbose:
-        print(f"Search results: {len(video_ids)} candidates")
+        print(f"Search results: {len(candidate_ids)} unique candidates across all passes")
+
+    # Drop IDs already stored so downstream quota is spent only on new videos.
+    existing_skipped = 0
+    if exclude_existing_video_ids and candidate_ids:
+        existing_ids = _fetch_all_video_ids(sb)
+        original_count = len(candidate_ids)
+        candidate_ids = [vid for vid in candidate_ids if vid not in existing_ids]
+        existing_skipped = original_count - len(candidate_ids)
+        if verbose:
+            print(
+                f"After excluding existing: {len(candidate_ids)} new candidates "
+                f"({existing_skipped} already in DB skipped)"
+            )
+        if not candidate_ids:
+            if verbose:
+                print(
+                    "0 new candidates — all search results already ingested. "
+                    "Skipping videos.list and downstream quota."
+                )
+            print(budget.summary())
+            return {
+                "video_ids": [],
+                "videos_upserted": 0,
+                "transcripts_saved": 0,
+                "candidates_total": original_count,
+                "candidates_new": 0,
+                "existing_skipped": existing_skipped,
+                "quota_used": budget.used,
+                "quota_budget": budget.budget,
+                "quota_breached": budget.breached,
+            }
 
     video_metadata: List[dict] = []
     filtered_ids: List[str] = []
@@ -1014,7 +1121,7 @@ def run_youtube_data_ingestion_pipeline(
     transcripts_saved = 0
 
     if not budget.breached:
-        video_metadata = _fetch_video_metadata(youtube, video_ids, budget)
+        video_metadata = _fetch_video_metadata(youtube, candidate_ids, budget)
         if verbose:
             print(f"Fetched metadata for {len(video_metadata)} videos")
 
@@ -1077,6 +1184,9 @@ def run_youtube_data_ingestion_pipeline(
         "video_ids": filtered_ids,
         "videos_upserted": videos_upserted,
         "transcripts_saved": transcripts_saved,
+        "candidates_total": len(candidate_ids) + existing_skipped,
+        "candidates_new": len(candidate_ids),
+        "existing_skipped": existing_skipped,
         "quota_used": budget.used,
         "quota_budget": budget.budget,
         "quota_breached": budget.breached,
@@ -1099,6 +1209,10 @@ def handler(event, context):
     kwargs = {}
     if "search_queries" in event:
         kwargs["search_queries"] = event["search_queries"]
+    if "search_order_passes" in event:
+        kwargs["search_order_passes"] = list(event["search_order_passes"])
+    if "exclude_existing_video_ids" in event:
+        kwargs["exclude_existing_video_ids"] = bool(event["exclude_existing_video_ids"])
     if "max_search_pages" in event:
         kwargs["max_search_pages"] = int(event["max_search_pages"])
     if "min_comments_per_1k" in event:
