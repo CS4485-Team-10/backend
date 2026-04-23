@@ -1,4 +1,0 @@
-python-dotenv
-supabase
-requests
-boto3

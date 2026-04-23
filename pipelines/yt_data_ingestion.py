@@ -74,7 +74,14 @@ _DEFAULT_SEARCH_QUERIES = [
 
 # YouTube search.list `order` allowlist.
 # Source: https://developers.google.com/youtube/v3/docs/search/list#order
-_VALID_SEARCH_ORDERS = {"date", "rating", "relevance", "title", "videoCount", "viewCount"}
+_VALID_SEARCH_ORDERS = {
+    "date",
+    "rating",
+    "relevance",
+    "title",
+    "videoCount",
+    "viewCount",
+}
 
 # Default multi-pass strategy: one pass for query relevance, one for popularity.
 _DEFAULT_SEARCH_ORDER_PASSES: List[str] = ["relevance", "viewCount"]
@@ -305,6 +312,7 @@ def _get_llm_provider_for_filtering() -> LLMProvider:
     raise ValueError(
         f"Unknown LLM_PROVIDER: {provider_name}. Use 'ollama' or 'bedrock'."
     )
+
 
 def _parse_json_from_llm_text(text: str) -> Optional[object]:
     """Parse JSON from model output; tolerate leading/trailing prose (e.g. 'Here is…' before `[`)."""
@@ -1082,7 +1090,9 @@ def run_youtube_data_ingestion_pipeline(
         verbose=verbose,
     )
     if verbose:
-        print(f"Search results: {len(candidate_ids)} unique candidates across all passes")
+        print(
+            f"Search results: {len(candidate_ids)} unique candidates across all passes"
+        )
 
     # Drop IDs already stored so downstream quota is spent only on new videos.
     existing_skipped = 0

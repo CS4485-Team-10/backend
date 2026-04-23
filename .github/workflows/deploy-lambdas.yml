@@ -5,8 +5,9 @@ on:
     branches: [main]
     paths:
       - "pipelines/**"
-      - "Dockerfiles/**"
+      - "docker/**"
       - ".github/workflows/deploy-lambdas.yml"
+  workflow_dispatch:
 
 permissions:
   id-token: write
@@ -18,25 +19,28 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash --noprofile --norc -eo pipefail {0}
     strategy:
       fail-fast: false
       matrix:
         include:
           - lambda_name: yt-data-ingestion-lambda
             ecr_repo: yt-data-ingestion
-            dockerfile: Dockerfiles/yt_data_ingestion.Dockerfile
+            dockerfile: docker/Dockerfile.yt
 
           - lambda_name: sentiment-analysis-lambda
             ecr_repo: sentiment-analysis
-            dockerfile: Dockerfiles/sentiment_analysis.Dockerfile
+            dockerfile: docker/Dockerfile.sentiment
 
           - lambda_name: misinfo-checker-lambda
             ecr_repo: misinfo-checker
-            dockerfile: Dockerfiles/misinfo_checker.Dockerfile
+            dockerfile: docker/Dockerfile.misinfo
 
           - lambda_name: llm-insight-generation-lambda
             ecr_repo: llm-insight-generation
-            dockerfile: Dockerfiles/llm_insight_generation.Dockerfile
+            dockerfile: docker/Dockerfile.llm
 
     steps:
       - name: Checkout
@@ -54,30 +58,75 @@ jobs:
       - name: Compute image URI
         id: vars
         run: |
+          set -x
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           IMAGE_TAG=${GITHUB_SHA}
           IMAGE_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ matrix.ecr_repo }}:${IMAGE_TAG}
 
-          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### ${{ matrix.lambda_name }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Region | \`${AWS_REGION}\` |"
+            echo "| ECR repository | \`${{ matrix.ecr_repo }}\` |"
+            echo "| Dockerfile | \`${{ matrix.dockerfile }}\` |"
+            echo "| Image tag | \`${IMAGE_TAG}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build image
+        env:
+          DOCKER_BUILDKIT: 1
         run: |
+          set -x
           docker build \
+            --progress=plain \
             -f "${{ matrix.dockerfile }}" \
             -t "${{ steps.vars.outputs.image_uri }}" \
             .
 
       - name: Push image
         run: |
+          set -x
           docker push "${{ steps.vars.outputs.image_uri }}"
 
       - name: Update Lambda function to new image
         run: |
+          set -x
           aws lambda update-function-code \
             --function-name "${{ matrix.lambda_name }}" \
             --image-uri "${{ steps.vars.outputs.image_uri }}"
 
       - name: Wait for update
         run: |
+          set -x
           aws lambda wait function-updated \
             --function-name "${{ matrix.lambda_name }}"
+
+      - name: Failure diagnostics
+        if: failure()
+        run: |
+          echo "::error::Deploy failed for ${{ matrix.lambda_name }} — see logs above for the first failing command."
+          echo "::group::Deploy context"
+          echo "Lambda: ${{ matrix.lambda_name }}"
+          echo "ECR repo: ${{ matrix.ecr_repo }}"
+          echo "Dockerfile: ${{ matrix.dockerfile }}"
+          echo "Region: ${AWS_REGION}"
+          echo "Commit: ${GITHUB_SHA}"
+          echo "::endgroup::"
+          echo "::group::Lambda configuration (may explain update/runtime issues)"
+          aws lambda get-function-configuration \
+            --function-name "${{ matrix.lambda_name }}" \
+            --output json \
+            --query '{
+              LastModified: LastModified,
+              State: State,
+              StateReason: StateReason,
+              LastUpdateStatus: LastUpdateStatus,
+              LastUpdateStatusReason: LastUpdateStatusReason,
+              PackageType: PackageType,
+              Architectures: Architectures
+            }' || echo "(get-function-configuration failed — check IAM or function name.)"
+          echo "::endgroup::"
