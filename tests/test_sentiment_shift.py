@@ -99,9 +99,7 @@ SAMPLE_CLAIMS = [
 def _call(client, params=None, rows=None):
     data = SAMPLE_CLAIMS if rows is None else rows
     sb = _build_sb_mock(data)
-    with patch(
-        "app.api.v1.endpoints.sentiment.create_client", return_value=sb
-    ):
+    with patch("app.api.v1.endpoints.sentiment.create_client", return_value=sb):
         return client.get("/api/v1/overview/sentiment-shift", params=params)
 
 
@@ -201,9 +199,7 @@ class TestDSLabelHandling:
     def test_avg_score_matches_arithmetic_mean(self, sentiment_client, supabase_env):
         # In 7d: scores are 0.8542, 0.21, -0.6732, 0.045, -0.02, 0.3
         body = _call(sentiment_client, {"range": "7d"}).json()
-        expected = round(
-            (0.8542 + 0.21 + (-0.6732) + 0.045 + (-0.02) + 0.3) / 6, 4
-        )
+        expected = round((0.8542 + 0.21 + (-0.6732) + 0.045 + (-0.02) + 0.3) / 6, 4)
         assert body["totals"]["avg_score"] == pytest.approx(expected, abs=1e-4)
 
 
