@@ -331,8 +331,8 @@ def is_health_claim(sentence: str) -> bool:
         candidate_labels=_HEALTH_LABELS + _NON_HEALTH_LABELS,
     )
     label_scores = dict(zip(result["labels"], result["scores"]))
-    health_score = sum(label_scores.get(l, 0) for l in _HEALTH_LABELS)
-    non_health_score = sum(label_scores.get(l, 0) for l in _NON_HEALTH_LABELS)
+    health_score = sum(label_scores.get(label, 0) for label in _HEALTH_LABELS)
+    non_health_score = sum(label_scores.get(label, 0) for label in _NON_HEALTH_LABELS)
     # Health must outscore non-health by at least 0.1 to avoid borderline misclassification
     return health_score > (non_health_score + 0.1)
 
