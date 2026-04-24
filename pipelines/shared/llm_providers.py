@@ -3,8 +3,38 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import requests
 from .data_models import LLMProvider
+
+# Bedrock `modelId` (including provider prefix, e.g. `qwen.*`). Not an Ollama short name.
+DEFAULT_BEDROCK_MODEL_ID = "qwen.qwen3-vl-235b-a22b"
+
+
+def _load_bedrock_dotenv() -> None:
+    """Load ``backend/.env`` then the parent of backend (e.g. repo root) ``.env``.
+
+    Same order as ``test.py`` (backend first; later file does not override by default).
+    No-op if ``python-dotenv`` is not installed. Missing files are ignored.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    # pipelines/shared/llm_providers.py -> parents[2] == backend (package root for this app)
+    backend = Path(__file__).resolve().parents[2]
+    load_dotenv(backend / ".env")
+    load_dotenv(backend.parent / ".env")
+
+
+def _resolve_bedrock_model_id(explicit: str | None) -> str:
+    if explicit is not None and explicit.strip():
+        return explicit.strip()
+    return (
+        (os.environ.get("BEDROCK_MODEL") or "").strip()
+        or (os.environ.get("LLM_MODEL") or "").strip()
+        or DEFAULT_BEDROCK_MODEL_ID
+    )
 
 
 class OllamaProvider(LLMProvider):
@@ -55,25 +85,29 @@ class OllamaProvider(LLMProvider):
 class BedrockProvider(LLMProvider):
     """Call Amazon Bedrock Converse API.
 
-    Authentication uses the default boto3 credential chain (same as AWS CLI):
+    On construction, this loads ``.env`` from the backend package and the parent
+    directory (if ``python-dotenv`` is available), then reads configuration.
 
-    - Environment: ``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, optional
-      ``AWS_SESSION_TOKEN`` (e.g. after ``load_dotenv()`` loads a local ``.env``).
-    - Shared config: ``~/.aws/credentials``, ``~/.aws/config``.
-    - Execution role: Lambda / EC2 / etc. (no access keys in ``.env``).
+    **Model ID:** pass ``model=``, or set ``BEDROCK_MODEL`` (preferred for Bedrock)
+    or ``LLM_MODEL`` in the environment, or rely on
+    :data:`DEFAULT_BEDROCK_MODEL_ID` (full Bedrock modelId, e.g. ``qwen.qwen3-vl-...``).
 
-    Region: constructor ``region``, else ``AWS_REGION`` / ``AWS_DEFAULT_REGION``,
-    else ``us-east-1``. Use a region where your model is available.
+    **Authentication** (boto3 default chain, same as AWS CLI):
+
+    - ``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, optional ``AWS_SESSION_TOKEN``
+    - ``~/.aws/credentials`` and ``~/.aws/config``
+    - Execution role in Lambda/EC2, etc.
+
+    **Region:** constructor ``region``, else ``AWS_REGION`` or ``AWS_DEFAULT_REGION``,
+    else ``us-east-1``. Use a region where the model is available.
     """
 
     name = "bedrock"
 
-    def __init__(
-        self,
-        model: str = "qwen3-vl-235b-a22b",
-        region: str | None = None,
-    ):
-        super().__init__(provider="bedrock", model=model)
+    def __init__(self, model: str | None = None, region: str | None = None) -> None:
+        _load_bedrock_dotenv()
+        resolved = _resolve_bedrock_model_id(model)
+        super().__init__(provider="bedrock", model=resolved)
         self.region = (
             region
             or os.environ.get("AWS_REGION")

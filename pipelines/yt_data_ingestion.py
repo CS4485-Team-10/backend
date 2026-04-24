@@ -303,12 +303,19 @@ Return ONLY valid JSON in this format:
 def _get_llm_provider_for_filtering() -> LLMProvider:
     """Build semantic-filter provider from LLM_PROVIDER/LLM_MODEL environment."""
     provider_name = (os.environ.get("LLM_PROVIDER") or "ollama").lower()
-    model = os.environ.get("INGEST_LLM_MODEL") or "gemma2"
 
     if provider_name == "ollama":
+        model = os.environ.get("INGEST_LLM_MODEL") or "gemma2"
         return OllamaProvider(model=model)
     if provider_name == "bedrock":
-        return BedrockProvider(model=model)
+        raw = (
+            os.environ.get("BEDROCK_MODEL")
+            or os.environ.get("LLM_MODEL")
+            or os.environ.get("INGEST_LLM_MODEL")
+            or ""
+        )
+        explicit = raw.strip() or None
+        return BedrockProvider(model=explicit)
     raise ValueError(
         f"Unknown LLM_PROVIDER: {provider_name}. Use 'ollama' or 'bedrock'."
     )
