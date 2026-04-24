@@ -8,7 +8,9 @@ from app.api.v1.endpoints import (
     health,
     ingest,
     narratives,
+    notify,
     overview,
+    sentiment,
     subscribers,
     supabase_ping,
     transcripts,
@@ -19,6 +21,7 @@ api_router = APIRouter()
 api_router.include_router(health.router, tags=["health"])
 api_router.include_router(supabase_ping.router, tags=["supabase"])
 api_router.include_router(overview.router, tags=["overview"])
+api_router.include_router(sentiment.router, tags=["sentiment"])
 api_router.include_router(videos.router, tags=["videos"])
 api_router.include_router(channels.router, tags=["channels"])
 api_router.include_router(narratives.router, tags=["narratives"])
@@ -27,4 +30,5 @@ api_router.include_router(transcripts.router, tags=["transcripts"])
 api_router.include_router(ingest.router, tags=["ingest"])
 api_router.include_router(creators.router, tags=["creators"])
 api_router.include_router(alerts.router, tags=["alerts"])
+api_router.include_router(notify.router, tags=["notify"])
 api_router.include_router(subscribers.router, tags=["subscribers"])
