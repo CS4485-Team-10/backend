@@ -22,7 +22,7 @@ logging.getLogger("torch").setLevel(logging.ERROR)
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-GOOGLE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+GOOGLE_API_KEY = os.environ.get("YOUTUBE_API_KEY_MISINFO", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 SUPABASE_TABLE_VIDEOS = "videos"
@@ -304,18 +304,37 @@ def check_entailment(claim: str, evidence: str | None = None) -> tuple[str, floa
     return label_map[top_label], round(result["scores"][0], 4)
 
 
+_HEALTH_LABELS = [
+    "a factual health or medical claim",
+    "a factual claim about psychology, cognition, or how the brain works",
+    "a claim about how biological or physiological states (fatigue, sleep, hunger) affect the body or mind",
+    "a claim about a medical condition or medical terminology",
+]
+_NON_HEALTH_LABELS = [
+    "a claim about social predictions, relationships, or statistics about human behavior",
+    "general conversational narration or non-scientific content",
+    "a claim about whether someone has romantic feelings or thoughts about you",
+]
+
+
 def is_health_claim(sentence: str) -> bool:
+    """
+    Classify whether a sentence is a health/medical/cognitive science claim.
+
+    Uses multiple candidate labels and compares aggregate health score vs
+    non-health score, rather than relying on a single binary label. This
+    catches claims spanning health, psychology, neuroscience, and medical
+    terminology, while excluding social behavior pseudoscience.
+    """
     result = nli_model(
         sentence,
-        candidate_labels=[
-            "a factual health or medical claim",
-            "general narration or filler",
-        ],
+        candidate_labels=_HEALTH_LABELS + _NON_HEALTH_LABELS,
     )
-    return (
-        result["labels"][0] == "a factual health or medical claim"
-        and result["scores"][0] > 0.6
-    )
+    label_scores = dict(zip(result["labels"], result["scores"]))
+    health_score = sum(label_scores.get(l, 0) for l in _HEALTH_LABELS)
+    non_health_score = sum(label_scores.get(l, 0) for l in _NON_HEALTH_LABELS)
+    # Health must outscore non-health by at least 0.1 to avoid borderline misclassification
+    return health_score > (non_health_score + 0.1)
 
 
 def analyze_claims(text: str, max_claims: int = 10) -> list[ClaimAnalysis]:
@@ -466,31 +485,78 @@ def _run_claim_sentiment(claim_text: str) -> tuple[str, float]:
 
 
 def _run_fact_check_status(claim_text: str) -> str:
+    """
+    Determine fact-check status using Google Fact Check API + NLI entailment fallback.
+
+    Priority:
+    1. Google Fact Check API (for viral misinformation)
+    2. NLI entailment check (for scientific/educational claims)
+
+    For educational content, we use a more lenient approach:
+    - If clearly refuted: verified_false
+    - If supported or not contradicted: verified_true
+    - Only mark unverifiable if truly ambiguous
+    """
     results = search_fact_checks(claim_text, max_results=3)
-    if not results:
-        return "pending"
 
-    FALSE_WORDS = {
-        "false",
-        "pants on fire",
-        "incorrect",
-        "misleading",
-        "wrong",
-        "inaccurate",
-        "fake",
-    }
-    TRUE_WORDS = {"true", "correct", "accurate", "verified", "mostly true"}
-    UNVERIFIABLE_WORDS = {"unverifiable", "unproven", "unclear", "mixed"}
+    # If Google Fact Check API has results, use them
+    if results:
+        FALSE_WORDS = {
+            "false",
+            "pants on fire",
+            "incorrect",
+            "misleading",
+            "wrong",
+            "inaccurate",
+            "fake",
+        }
+        TRUE_WORDS = {"true", "correct", "accurate", "verified", "mostly true"}
+        UNVERIFIABLE_WORDS = {"unverifiable", "unproven", "unclear", "mixed"}
 
-    for fc in results:
-        rating = fc.rating.lower()
-        if any(w in rating for w in FALSE_WORDS):
-            return "verified_false"
-        if any(w in rating for w in TRUE_WORDS):
-            return "verified_true"
-        if any(w in rating for w in UNVERIFIABLE_WORDS):
-            return "unverifiable"
+        for fc in results:
+            rating = fc.rating.lower()
+            if any(w in rating for w in FALSE_WORDS):
+                return "verified_false"
+            if any(w in rating for w in TRUE_WORDS):
+                return "verified_true"
+            if any(w in rating for w in UNVERIFIABLE_WORDS):
+                return "unverifiable"
 
+        return "unverifiable"
+
+    # No fact-check results - use NLI entailment as fallback
+    # Strategy:
+    # 1. Check ALL claims for refutation (catch myths/misinformation)
+    # 2. Only verify TRUE for health claims (prevent false positives)
+
+    entailment_label, entailment_conf = check_entailment(claim_text)
+
+    # VERIFIED FALSE: Strongly refuted by medical science (ANY claim type)
+    # This catches health myths like "vaccines cause autism" and potentially
+    # other pseudoscientific claims that contradict established science
+    if entailment_label == "refuted" and entailment_conf >= 0.65:
+        return "verified_false"
+
+    # VERIFIED TRUE: Only for actual health/medical claims
+    # Check if this is a health claim before marking as verified_true
+    health_claim = is_health_claim(claim_text)
+    if not health_claim:
+        # Not a health claim - don't verify as true even if "supported"
+        # This prevents relationship/psychology pseudoscience from being verified
+        return "unverifiable"
+
+    # It's a health claim - check if supported by medical science
+    if entailment_label == "supported" and entailment_conf >= 0.55:
+        return "verified_true"
+
+    # For neutral/supported health claims with reasonable confidence.
+    # Threshold is 0.48 (not 0.50) to catch borderline cases like
+    # "Sleep just 4 hours and your body starts breaking down" (neutral: 0.4968)
+    # which are factually accurate but stated conversationally.
+    if entailment_label in ["neutral", "supported"] and entailment_conf >= 0.48:
+        return "verified_true"
+
+    # Low confidence or ambiguous claim
     return "unverifiable"
 
 
@@ -540,25 +606,34 @@ def _calculate_claim_risk_level(
     return "low"
 
 
-def process_claims_table(batch_size: int = 50):
+def process_claims_table(batch_size: int = 50, force_reprocess: bool = False):
+    """
+    Process claims in the Supabase claims table, enriching null fields.
+
+    Args:
+        batch_size: Maximum number of claims to process in one batch
+        force_reprocess: If True, reprocess ALL claims including verified_true
+    """
     client = get_supabase_client()
 
-    resp = (
-        client.table("claims")
-        .select(
-            "claim_id, claim_text, sentiment_label, sentiment_score, "
-            "fact_check_status, fact_check_confidence, risk_level"
-        )
-        .or_(
+    query = client.table("claims").select(
+        "claim_id, claim_text, sentiment_label, sentiment_score, "
+        "fact_check_status, fact_check_confidence, risk_level"
+    )
+
+    if not force_reprocess:
+        # Only process claims with incomplete data
+        query = query.or_(
             "sentiment_label.is.null,"
             "sentiment_score.is.null,"
             "fact_check_status.is.null,"
+            "fact_check_status.eq.pending,"
+            "fact_check_status.eq.unverifiable,"
             "fact_check_confidence.is.null,"
             "risk_level.is.null"
         )
-        .limit(batch_size)
-        .execute()
-    )
+
+    resp = query.limit(batch_size).execute()
 
     rows = resp.data
     if not rows:
@@ -581,10 +656,25 @@ def process_claims_table(batch_size: int = 50):
             updates["sentiment_score"] = sent_score
             print(f"    sentiment: {sent_label} ({sent_score:+.4f})")
 
-        if row["fact_check_status"] is None:
+        # Reprocess fact_check_status if:
+        # 1. force_reprocess is True, OR
+        # 2. Status is None or needs reprocessing (pending/unverifiable)
+        should_reprocess_status = (
+            force_reprocess
+            or row["fact_check_status"] is None
+            or row["fact_check_status"] in ["pending", "unverifiable", "verified_true"]
+        )
+
+        if should_reprocess_status:
             fc_status = _run_fact_check_status(claim_text)
-            updates["fact_check_status"] = fc_status
-            print(f"    fact_check_status: {fc_status}")
+            # Only update if status actually changed (avoid unnecessary writes)
+            if fc_status != row["fact_check_status"]:
+                updates["fact_check_status"] = fc_status
+                print(
+                    f"    fact_check_status: {row['fact_check_status']} → {fc_status}"
+                )
+            else:
+                print(f"    fact_check_status: {fc_status} (unchanged)")
 
         entailment_label = "neutral"
         entailment_conf = 0.0
@@ -875,14 +965,208 @@ def handler(event, context):
     )
 
 
+# ---------------------------------------------------------------------------
+# Narrative Enrichment
+# ---------------------------------------------------------------------------
+
+NARRATIVE_HEALTH_CATEGORIES = [
+    "Vaccines and Immunization",
+    "Mental Health and Wellness",
+    "Chronic Disease Management",
+    "Healthcare Systems and Policy",
+    "Sleep and Circadian Health",
+    "Nutrition and Diet",
+    "Medications and Pharmaceuticals",
+    "Infectious Diseases",
+    "Alternative Medicine",
+    "General Health Education",
+]
+
+
+def _categorize_narrative(narrative_text: str) -> tuple[str, float]:
+    """Classify narrative into health categories using NLI."""
+    result = nli_model(narrative_text, candidate_labels=NARRATIVE_HEALTH_CATEGORIES)
+    return result["labels"][0], round(result["scores"][0], 4)
+
+
+def _calculate_narrative_risk(claims_data: list[dict]) -> dict:
+    """Calculate aggregate risk score and statistics from associated claims."""
+    if not claims_data:
+        return {
+            "risk_score": 5.0,
+            "details": {
+                "total_claims": 0,
+                "high_risk_claims": 0,
+                "medium_risk_claims": 0,
+                "low_risk_claims": 0,
+                "avg_sentiment": 0.0,
+                "verified_false_count": 0,
+            },
+        }
+
+    high_count = sum(1 for c in claims_data if c.get("risk_level") == "high")
+    medium_count = sum(1 for c in claims_data if c.get("risk_level") == "medium")
+    low_count = sum(1 for c in claims_data if c.get("risk_level") == "low")
+
+    verified_false_count = sum(
+        1 for c in claims_data if c.get("fact_check_status") == "verified_false"
+    )
+
+    # Calculate average sentiment
+    sentiment_scores = [
+        c.get("sentiment_score", 0)
+        for c in claims_data
+        if c.get("sentiment_score") is not None
+    ]
+    avg_sentiment = (
+        sum(sentiment_scores) / len(sentiment_scores) if sentiment_scores else 0.0
+    )
+
+    # Calculate risk score (1-10 scale)
+    # High risk: more high-risk claims or verified false claims
+    # Low risk: mostly low-risk claims
+    total = len(claims_data)
+    risk_score = 5.0  # Default neutral
+
+    if total > 0:
+        high_ratio = high_count / total
+        verified_false_ratio = verified_false_count / total
+
+        # Weight: high risk claims and verified false claims increase risk
+        if high_ratio > 0.5 or verified_false_ratio > 0.3:
+            risk_score = 8.0 + (high_ratio * 2.0)  # Scale 8-10
+        elif high_ratio > 0.2 or verified_false_ratio > 0.1:
+            risk_score = 6.0 + (high_ratio * 2.0)  # Scale 6-8
+        elif medium_count > low_count:
+            risk_score = 5.0  # Neutral
+        else:
+            risk_score = 3.0 - (low_count / total * 2.0)  # Scale 1-3
+
+        # Clamp to 1-10
+        risk_score = max(1.0, min(10.0, risk_score))
+
+    return {
+        "risk_score": round(risk_score, 2),
+        "details": {
+            "total_claims": total,
+            "high_risk_claims": high_count,
+            "medium_risk_claims": medium_count,
+            "low_risk_claims": low_count,
+            "avg_sentiment": round(avg_sentiment, 4),
+            "verified_false_count": verified_false_count,
+        },
+    }
+
+
+def process_narratives_table(batch_size: int = 50):
+    """Enrich narratives with category and risk score based on associated claims."""
+    client = get_supabase_client()
+
+    # Get narratives that need enrichment (category is "Uncategorized" or risk is 5.0)
+    resp = (
+        client.table("narratives")
+        .select(
+            "narrative_id, narrative_label, narrative_description, narrative_category"
+        )
+        .or_("narrative_category.eq.Uncategorized,narrative_risk_score.eq.5.0")
+        .limit(batch_size)
+        .execute()
+    )
+
+    rows = resp.data
+    if not rows:
+        print("No narratives need enrichment.")
+        return
+
+    print(f"Processing {len(rows)} narrative(s)...\n")
+
+    for i, row in enumerate(rows, 1):
+        narrative_id = row["narrative_id"]
+        narrative_label = row["narrative_label"]
+        narrative_desc = row.get("narrative_description", "")
+
+        print(f"  [{i}/{len(rows)}] narrative_id={narrative_id}")
+        print(f"    label: {narrative_label}")
+
+        # Build narrative text for classification
+        narrative_text = (
+            f"{narrative_label}. {narrative_desc}"
+            if narrative_desc
+            else narrative_label
+        )
+
+        updates = {}
+
+        # Categorize narrative
+        if row["narrative_category"] == "Uncategorized":
+            category, confidence = _categorize_narrative(narrative_text)
+            updates["narrative_category"] = category
+            print(f"    category: {category} (confidence: {confidence:.4f})")
+
+        # Get associated claims to calculate risk
+        claims_resp = (
+            client.table("claim_narratives")
+            .select("claim_id")
+            .eq("narrative_id", narrative_id)
+            .execute()
+        )
+
+        claim_ids = [c["claim_id"] for c in claims_resp.data]
+
+        if claim_ids:
+            # Get claim details
+            claims_data_resp = (
+                client.table("claims")
+                .select("claim_id, risk_level, sentiment_score, fact_check_status")
+                .in_("claim_id", claim_ids)
+                .execute()
+            )
+
+            claims_data = claims_data_resp.data
+
+            # Calculate narrative risk
+            risk_result = _calculate_narrative_risk(claims_data)
+            updates["narrative_risk_score"] = risk_result["risk_score"]
+            updates["narrative_details"] = json.dumps(risk_result["details"])
+
+            print(f"    risk_score: {risk_result['risk_score']}")
+            print(f"    claims analyzed: {risk_result['details']['total_claims']}")
+        else:
+            print("    No claims linked to this narrative")
+
+        # Update narrative
+        if updates:
+            client.table("narratives").update(updates).eq(
+                "narrative_id", narrative_id
+            ).execute()
+            print(f"    [OK] Updated narrative {narrative_id}\n")
+
+    print(f"Done. {len(rows)} narrative(s) processed.")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "4":
+        batch = 50
+        force = False
+        if "--batch" in sys.argv:
+            idx = sys.argv.index("--batch")
+            if idx + 1 < len(sys.argv):
+                batch = int(sys.argv[idx + 1])
+        if "--force" in sys.argv:
+            force = True
+            print(
+                "Force reprocess mode: Will reprocess ALL claims including verified_true"
+            )
+        process_claims_table(batch_size=batch, force_reprocess=force)
+        sys.exit(0)
+
+    if len(sys.argv) > 1 and sys.argv[1] == "5":
         batch = 50
         if "--batch" in sys.argv:
             idx = sys.argv.index("--batch")
             if idx + 1 < len(sys.argv):
                 batch = int(sys.argv[idx + 1])
-        process_claims_table(batch_size=batch)
+        process_narratives_table(batch_size=batch)
         sys.exit(0)
 
     write_json = "--json" in sys.argv
@@ -909,7 +1193,7 @@ if __name__ == "__main__":
             video_ids = ids_from_supabase_without_factcheck()
         else:
             print(
-                f"Unknown mode '{mode}'. Use: no args | 1 <file> | 2 | 3 | --video <ID>"
+                f"Unknown mode '{mode}'. Use: no args | 1 <file> | 2 | 3 | 4 [--batch N] | 5 [--batch N] | --video <ID>"
             )
             sys.exit(1)
 
