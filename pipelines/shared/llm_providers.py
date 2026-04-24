@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import os
 import requests
-
 from .data_models import LLMProvider
 
 
@@ -53,17 +53,37 @@ class OllamaProvider(LLMProvider):
 
 
 class BedrockProvider(LLMProvider):
-    """Call Amazon Bedrock Converse API."""
+    """Call Amazon Bedrock Converse API.
+
+    Authentication uses the default boto3 credential chain (same as AWS CLI):
+
+    - Environment: ``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, optional
+      ``AWS_SESSION_TOKEN`` (e.g. after ``load_dotenv()`` loads a local ``.env``).
+    - Shared config: ``~/.aws/credentials``, ``~/.aws/config``.
+    - Execution role: Lambda / EC2 / etc. (no access keys in ``.env``).
+
+    Region: constructor ``region``, else ``AWS_REGION`` / ``AWS_DEFAULT_REGION``,
+    else ``us-east-1``. Use a region where your model is available.
+    """
 
     name = "bedrock"
 
-    def __init__(self, model: str = "qwen3-vl-235b-a22b", region: str = "us-east-1"):
+    def __init__(
+        self,
+        model: str = "qwen3-vl-235b-a22b",
+        region: str | None = None,
+    ):
         super().__init__(provider="bedrock", model=model)
-        self.region = region
+        self.region = (
+            region
+            or os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or "us-east-1"
+        )
         self._client = None
 
     def _get_client(self):
-        """Lazy-load boto3 client."""
+        """Lazy-load boto3 client (credentials resolved by boto3, not hard-coded)."""
         if self._client is None:
             try:
                 import boto3
@@ -74,7 +94,8 @@ class BedrockProvider(LLMProvider):
                 ) from None
 
             self._client = boto3.client(
-                service_name="bedrock-runtime", region_name=self.region
+                service_name="bedrock-runtime",
+                region_name=self.region,
             )
         return self._client
 
@@ -106,9 +127,11 @@ class BedrockProvider(LLMProvider):
             error_msg = str(e)
             if "AccessDeniedException" in error_msg:
                 raise RuntimeError(
-                    "AWS credentials not configured or invalid. "
-                    "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables "
-                    "or configure ~/.aws/credentials"
+                    "Bedrock access denied: check IAM allows bedrock:InvokeModel (or "
+                    "equivalent) for this model in this region. Locally, ensure "
+                    "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and optional "
+                    "AWS_SESSION_TOKEN) are set—e.g. via .env loaded before use—or use "
+                    "~/.aws/credentials. On Lambda, use the function execution role, not .env."
                 ) from e
             elif (
                 "ResourceNotFoundException" in error_msg

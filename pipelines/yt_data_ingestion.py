@@ -912,7 +912,7 @@ def _upsert_videos(
     return len(rows)
 
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 _ytt_proxy_username = os.getenv("YOUTUBE_TRANSCRIPT_PROXY_USERNAME")
 _ytt_proxy_password = os.getenv("YOUTUBE_TRANSCRIPT_PROXY_PASSWORD")
 if _ytt_proxy_username and _ytt_proxy_password:
@@ -1060,7 +1060,7 @@ def run_youtube_data_ingestion_pipeline(
             before videos.list and all downstream quota is spent.  Set to False
             for local re-runs where re-processing is acceptable.
     """
-    load_dotenv()
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
     api_key = os.getenv("YOUTUBE_DATA_API_KEY")
     if not api_key:
         raise ValueError("YOUTUBE_DATA_API_KEY not set in environment")
