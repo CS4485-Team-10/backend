@@ -305,11 +305,11 @@ def _get_llm_provider_for_filtering() -> LLMProvider:
     provider_name = (os.environ.get("LLM_PROVIDER") or "ollama").lower()
 
     if provider_name == "ollama":
-        model = os.environ.get("INGEST_LLM_MODEL") or "gemma2"
+        model = os.environ.get("OLLAMA_LLM_MODEL") or "gemma2"
         return OllamaProvider(model=model)
     if provider_name == "bedrock":
         raw = (
-            os.environ.get("BEDROCK_MODEL")
+            os.environ.get("BEDROCK_LLM_MODEL")
             or os.environ.get("LLM_MODEL")
             or os.environ.get("INGEST_LLM_MODEL")
             or ""
@@ -1055,6 +1055,11 @@ def run_youtube_data_ingestion_pipeline(
     Order: search (multi-pass) → exclude existing DB IDs → videos.list metadata →
     duration filter → language heuristic → impact filter →
     LLM semantic filter (relevance + English-usable) → upsert + transcripts.
+
+    The semantic filter uses ``_get_llm_provider_for_filtering()``: set
+    ``LLM_PROVIDER=bedrock`` (default is ``ollama``) and optionally ``BEDROCK_MODEL``,
+    ``LLM_MODEL``, or ``INGEST_LLM_MODEL`` for the Bedrock model ID (see
+    ``BedrockProvider`` in ``pipelines.shared.llm_providers``).
 
     Args:
         search_order_passes: List of YouTube search `order` values to sweep through.

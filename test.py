@@ -23,7 +23,11 @@ DEFAULT_BEDROCK_MODEL = "qwen.qwen3-235b-a22b-2507-v1:0"
 def main() -> None:
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
     model = os.environ.get("BEDROCK_MODEL", DEFAULT_BEDROCK_MODEL)
-    provider = BedrockProvider(model=model, region=region) if region else BedrockProvider(model=model)
+    provider = (
+        BedrockProvider(model=model, region=region)
+        if region
+        else BedrockProvider(model=model)
+    )
 
     print(f"Model: {provider.model}\nRegion: {provider.region}\nEmpty line to exit.\n")
     while True:

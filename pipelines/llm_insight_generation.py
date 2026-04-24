@@ -469,7 +469,9 @@ def _get_provider_from_env() -> LLMProvider:
         return OllamaProvider(model=model, base_url=base_url)
     if provider_name == "bedrock":
         # Full Bedrock modelId: use BEDROCK_MODEL, else LLM_MODEL, else library default
-        explicit = (os.environ.get("BEDROCK_MODEL") or os.environ.get("LLM_MODEL") or "").strip() or None
+        explicit = (
+            os.environ.get("BEDROCK_MODEL") or os.environ.get("LLM_MODEL") or ""
+        ).strip() or None
         return BedrockProvider(model=explicit)
     raise ValueError(
         f"Unknown LLM_PROVIDER: {provider_name}. Use 'ollama' or 'bedrock'."
