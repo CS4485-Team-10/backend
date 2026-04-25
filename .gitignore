@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 .ruff_cache/
 .hf_cache/
+/debug_logs
