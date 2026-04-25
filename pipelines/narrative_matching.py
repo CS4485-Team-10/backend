@@ -1,4 +1,9 @@
-"""Match claims to existing narratives or create new ones."""
+"""Match claims to existing narratives or create new ones.
+
+Embeddings come from **AWS Bedrock Titan Text Embeddings V2** via
+``bedrock-runtime`` ``invoke_model``. Embeddings are produced and used
+in-memory only; nothing is persisted.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +29,45 @@ NEW_NARRATIVE_MIN: float = float(os.environ.get("NARR_NEW_MIN", "0.72"))
 MAX_NARRATIVES_PER_CLAIM: int = int(os.environ.get("NARR_MAX_PER_CLAIM", "5"))
 
 _DEFAULT_EMBEDDING_TIMEOUT = 60.0
+_DEFAULT_BEDROCK_EMBEDDING_MODEL = "amazon.titan-embed-text-v2:0"
+_DEFAULT_BEDROCK_EMBEDDING_DIMENSIONS = 512
+_DEFAULT_BEDROCK_EMBEDDING_NORMALIZE = True
+
+
+def _parse_bool_env(raw: Optional[str], default: bool) -> bool:
+    """Parse a permissive truthy/falsey env value."""
+    if raw is None:
+        return default
+    s = raw.strip().lower()
+    if not s:
+        return default
+    if s in {"true", "1", "yes", "y", "on"}:
+        return True
+    if s in {"false", "0", "no", "n", "off"}:
+        return False
+    raise ValueError(f"invalid boolean env value: {raw!r}")
+
+
+def _float_env(name: str, default: float) -> float:
+    """Read a float from env, treating missing or blank as ``default``."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError as e:
+        raise ValueError(f"{name} must be a number.") from e
+
+
+def _int_env(name: str, default: int) -> int:
+    """Read an int from env, treating missing or blank as ``default``."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip(), 10)
+    except ValueError as e:
+        raise ValueError(f"{name} must be an integer.") from e
 
 
 def _l2_normalize_rows(arr: np.ndarray) -> np.ndarray:
@@ -93,96 +137,130 @@ class BaseEmbedder(ABC):
         """Return L2-normalized embeddings."""
 
 
-def _gemini_error_detail(resp: Any) -> str:
-    """Extract a short Gemini error string."""
-    try:
-        data = resp.json()
-        err = data.get("error")
-        if isinstance(err, dict) and err.get("message"):
-            return str(err["message"])[:500]
-    except (json.JSONDecodeError, ValueError, TypeError):
-        pass
-    return (getattr(resp, "text", None) or "")[:500]
-
-
-class RemoteEmbedder(BaseEmbedder):
-    """Gemini embedContent client."""
+class BedrockTitanEmbedder(BaseEmbedder):
+    """AWS Bedrock Titan Text Embeddings V2 client (``invoke_model``)."""
 
     def __init__(
         self,
-        url: str,
         *,
-        model: Optional[str] = None,
-        api_key: Optional[str] = None,
+        model: str,
+        region: str,
+        dimensions: int,
+        normalize: bool,
         timeout_seconds: float = _DEFAULT_EMBEDDING_TIMEOUT,
     ) -> None:
-        import requests as requests_lib
+        try:
+            import boto3
+            from botocore.config import Config
+        except ImportError as e:
+            raise ImportError(
+                "boto3 is required for BedrockTitanEmbedder. "
+                "Install it with: pip install boto3"
+            ) from e
 
-        self._requests = requests_lib
-        self._url = url.rstrip("/")
         self._model = model
-        self._api_key = api_key
-        self._timeout = timeout_seconds
+        self._region = region
+        self._dimensions = dimensions
+        self._normalize = normalize
+        self._client = boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            config=Config(
+                connect_timeout=timeout_seconds,
+                read_timeout=timeout_seconds,
+            ),
+        )
 
     def _embed_one(self, text: str) -> np.ndarray:
-        """Call Gemini once and return one raw vector."""
-        body: Dict[str, Any] = {
-            "content": {"parts": [{"text": text}]},
-            "taskType": "SEMANTIC_SIMILARITY",
+        """Call Titan once and return one raw vector."""
+        s = (text or "").strip()
+        if not s:
+            raise RuntimeError(
+                "Cannot embed empty text with Bedrock Titan Text Embeddings V2."
+            )
+
+        body = {
+            "inputText": s,
+            "dimensions": self._dimensions,
+            "normalize": self._normalize,
         }
-        headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["x-goog-api-key"] = self._api_key
+
         try:
-            resp = self._requests.post(
-                self._url,
-                json=body,
-                headers=headers,
-                timeout=self._timeout,
+            from botocore.exceptions import BotoCoreError, ClientError
+        except ImportError as e:
+            raise ImportError("botocore is required for BedrockTitanEmbedder.") from e
+
+        try:
+            response = self._client.invoke_model(
+                modelId=self._model,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(body),
             )
-        except self._requests.RequestException as e:
+        except ClientError as e:
+            error_msg = str(e)
+            if "AccessDeniedException" in error_msg:
+                raise RuntimeError(
+                    f"Bedrock Titan invoke_model access denied (model={self._model!r}, "
+                    f"region={self._region!r}): ensure IAM allows "
+                    "bedrock:InvokeModel for this model in this region. "
+                    "Locally, verify AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY "
+                    "(and optional AWS_SESSION_TOKEN) are loaded."
+                ) from e
+            if (
+                "ResourceNotFoundException" in error_msg
+                or "ValidationException" in error_msg
+            ):
+                raise RuntimeError(
+                    f"Bedrock Titan model {self._model!r} not found or invalid "
+                    f"in region {self._region!r}: verify the model id and that "
+                    "the model is enabled in this region."
+                ) from e
             raise RuntimeError(
-                f"Gemini embedContent request failed ({self._url!r}): {e}"
+                f"Bedrock Titan invoke_model failed (model={self._model!r}, "
+                f"region={self._region!r}): {error_msg}"
             ) from e
-        if not resp.ok:
-            detail = _gemini_error_detail(resp)
+        except BotoCoreError as e:
             raise RuntimeError(
-                f"Gemini embedContent HTTP {resp.status_code} ({self._url!r}): {detail}"
+                f"Bedrock Titan invoke_model transport failure (model={self._model!r}, "
+                f"region={self._region!r}): {e}"
+            ) from e
+
+        try:
+            raw = response["body"].read()
+            data = json.loads(raw)
+        except (KeyError, AttributeError, TypeError, json.JSONDecodeError) as e:
+            raise RuntimeError(
+                f"Bedrock Titan response is not valid JSON (model={self._model!r}): {e}"
+            ) from e
+
+        embedding = data.get("embedding") if isinstance(data, dict) else None
+        if not isinstance(embedding, list) or not embedding:
+            raise RuntimeError(
+                f"Bedrock Titan response missing non-empty 'embedding' list "
+                f"(model={self._model!r})"
             )
         try:
-            data = resp.json()
-        except json.JSONDecodeError as e:
+            vec = np.asarray(embedding, dtype=np.float64)
+        except (TypeError, ValueError) as e:
             raise RuntimeError(
-                f"Gemini embedContent response is not JSON ({self._url!r}): {e}"
+                f"Bedrock Titan 'embedding' is not numeric (model={self._model!r}): {e}"
             ) from e
-        if isinstance(data.get("error"), dict):
-            msg = data["error"].get("message", str(data["error"]))
-            raise RuntimeError(f"Gemini embedContent API error ({self._url!r}): {msg}")
-        emb = data.get("embedding")
-        if not isinstance(emb, dict):
-            raise RuntimeError(
-                f"Gemini response missing 'embedding' object ({self._url!r})"
-            )
-        values = emb.get("values")
-        if values is None:
-            raise RuntimeError(
-                f"Gemini response missing 'embedding.values' ({self._url!r})"
-            )
-        vec = np.asarray(values, dtype=np.float64)
         if vec.ndim != 1:
             raise RuntimeError(
-                f"Gemini embedding must be 1-D, got shape {vec.shape} ({self._url!r})"
+                f"Bedrock Titan embedding must be 1-D, got shape {vec.shape} "
+                f"(model={self._model!r})"
             )
         if not np.isfinite(vec).all():
             raise RuntimeError(
-                f"Gemini embedding has non-finite values ({self._url!r})"
+                f"Bedrock Titan embedding has non-finite values (model={self._model!r})"
             )
         return vec
 
     def encode(self, texts: List[str]) -> np.ndarray:
         if not texts:
             return np.empty((0, 0))
-        log.debug("Gemini embedContent: %d text(s)", len(texts))
+        log.debug("Bedrock Titan invoke_model: %d text(s)", len(texts))
         rows: List[np.ndarray] = []
         dim: Optional[int] = None
         for t in texts:
@@ -191,8 +269,8 @@ class RemoteEmbedder(BaseEmbedder):
                 dim = int(vec.shape[0])
             elif int(vec.shape[0]) != dim:
                 raise RuntimeError(
-                    f"Inconsistent Gemini embedding dimensions: expected {dim}, "
-                    f"got {int(vec.shape[0])} ({self._url!r})"
+                    f"Inconsistent Bedrock Titan embedding dimensions: expected {dim}, "
+                    f"got {int(vec.shape[0])} (model={self._model!r})"
                 )
             rows.append(vec)
         arr = np.stack(rows, axis=0)
@@ -200,45 +278,75 @@ class RemoteEmbedder(BaseEmbedder):
             _validate_embeddings(texts, arr)
         except ValueError as e:
             raise RuntimeError(
-                f"Invalid Gemini embedding matrix ({self._url!r}): {e}"
+                f"Invalid Bedrock Titan embedding matrix (model={self._model!r}): {e}"
             ) from e
         return _l2_normalize_rows(arr)
 
 
 def get_embedder_from_env() -> BaseEmbedder:
+    """Build the configured embedder from environment variables.
+
+    Only backend is **AWS Bedrock Titan Text Embeddings V2** via
+    ``invoke_model``. ``NARR_EMBEDDING_BACKEND`` is optional and, if set, must
+    equal ``bedrock``.
+    """
     backend = (
-        (os.environ.get("NARR_EMBEDDING_BACKEND") or "remote").lower().replace("-", "_")
+        (os.environ.get("NARR_EMBEDDING_BACKEND") or "bedrock")
+        .lower()
+        .replace("-", "_")
     )
-    if backend != "remote":
+    if backend != "bedrock":
         raise ValueError(
             f"Unsupported NARR_EMBEDDING_BACKEND: {backend!r}. "
-            "Only 'remote' (Google Gemini embedContent) is supported."
+            "Only 'bedrock' (AWS Bedrock Titan Text Embeddings V2 via "
+            "invoke_model) is supported."
         )
-    timeout = float(
-        os.environ.get("NARR_EMBEDDING_TIMEOUT", str(_DEFAULT_EMBEDDING_TIMEOUT))
-    )
-    api_key = os.environ.get("NARR_EMBEDDING_API_KEY") or None
-    url = os.environ.get("NARR_EMBEDDING_URL", "").strip()
-    if not url:
+
+    timeout = _float_env("NARR_EMBEDDING_TIMEOUT", _DEFAULT_EMBEDDING_TIMEOUT)
+
+    region = (
+        os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or ""
+    ).strip()
+    if not region:
         raise ValueError(
-            "NARR_EMBEDDING_URL must be set (Gemini embedContent endpoint)."
+            "AWS_REGION (or AWS_DEFAULT_REGION) must be set for the Bedrock "
+            "Titan embedding backend."
         )
-    remote_model = os.environ.get("NARR_EMBEDDING_MODEL")
-    log_model = remote_model if remote_model else "(unset)"
-    embedder: BaseEmbedder = RemoteEmbedder(
-        url,
-        model=remote_model or None,
-        api_key=api_key,
+    model_raw = os.environ.get("NARR_EMBEDDING_MODEL")
+    model = (
+        model_raw if model_raw is not None else _DEFAULT_BEDROCK_EMBEDDING_MODEL
+    ).strip()
+    if not model:
+        raise ValueError(
+            "NARR_EMBEDDING_MODEL is set but empty; expected a Bedrock Titan "
+            "model id (e.g. 'amazon.titan-embed-text-v2:0')."
+        )
+    dimensions = _int_env(
+        "NARR_EMBEDDING_DIMENSIONS", _DEFAULT_BEDROCK_EMBEDDING_DIMENSIONS
+    )
+    if dimensions <= 0:
+        raise ValueError("NARR_EMBEDDING_DIMENSIONS must be a positive integer.")
+    normalize = _parse_bool_env(
+        os.environ.get("NARR_EMBEDDING_NORMALIZE"),
+        _DEFAULT_BEDROCK_EMBEDDING_NORMALIZE,
+    )
+
+    embedder: BaseEmbedder = BedrockTitanEmbedder(
+        model=model,
+        region=region,
+        dimensions=dimensions,
+        normalize=normalize,
         timeout_seconds=timeout,
     )
 
     log.info(
-        "Narrative embedding backend: %s (model=%s)",
-        backend,
-        log_model,
+        "Narrative embedding backend: bedrock (model=%s, region=%s, "
+        "dimensions=%d, normalize=%s)",
+        model,
+        region,
+        dimensions,
+        normalize,
     )
-    log.debug("NARR_EMBEDDING_URL=%s", url)
-
     return embedder
 
 
