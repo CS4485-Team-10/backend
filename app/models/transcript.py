@@ -14,7 +14,12 @@ class Transcript(SQLModel, table=True):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     processing_status: str = Field(
-        default="pending", sa_column=Column(Text, nullable=False)
+        default="pending",
+        description=(
+            "pending (fresh ingest), pending_completion (retry after timeout/error), "
+            "in_progress, done"
+        ),
+        sa_column=Column(Text, nullable=False),
     )
     last_attempted_at: Optional[datetime] = Field(default=None, nullable=True)
     attempt_count: int = Field(default=0, nullable=False)

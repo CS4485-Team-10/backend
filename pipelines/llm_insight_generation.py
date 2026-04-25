@@ -41,6 +41,11 @@ _DEFAULT_TRANSCRIPT_BATCH_LIMIT = 20
 _MAX_TRANSCRIPT_ATTEMPTS = 5
 _DEFAULT_IN_PROGRESS_STALE_MINUTES = 30
 
+# Fresh work from ingestion — safe to replace any existing claims for this transcript.
+_STATUS_PENDING = "pending"
+# Retry after Lambda timeout / crash / failed attempt — merge new claims only; never wipe.
+_STATUS_PENDING_COMPLETION = "pending_completion"
+
 # Defensive max lengths for parsed LLM fields (downstream of JSON only; prompts unchanged).
 _MAX_CLAIM_TEXT_CHARS = 100_000
 _MAX_NARRATIVE_THEME_CHARS = 500
@@ -145,23 +150,26 @@ def _get_stale_in_progress_threshold_utc() -> datetime:
 
 
 def _release_stale_in_progress(sb) -> None:
-    """Move stale in_progress rows back to pending so they can be retried.
+    """Move stale in_progress rows to pending_completion so they can be retried.
+
+    Uses pending_completion (not pending) so the insight job can merge new rows
+    without deleting claims that may already have been persisted before timeout.
 
     Does not change attempt_count. Only rows still under the attempt cap are
     touched so retry-capped transcripts remain excluded.
     """
     threshold = _get_stale_in_progress_threshold_utc().isoformat()
     try:
-        sb.table("transcripts").update({"processing_status": "pending"}).eq(
-            "processing_status", "in_progress"
-        ).lt("attempt_count", _MAX_TRANSCRIPT_ATTEMPTS).lt(
-            "last_attempted_at", threshold
-        ).execute()
-        sb.table("transcripts").update({"processing_status": "pending"}).eq(
-            "processing_status", "in_progress"
-        ).lt("attempt_count", _MAX_TRANSCRIPT_ATTEMPTS).is_(
-            "last_attempted_at", "null"
-        ).execute()
+        sb.table("transcripts").update(
+            {"processing_status": _STATUS_PENDING_COMPLETION}
+        ).eq("processing_status", "in_progress").lt(
+            "attempt_count", _MAX_TRANSCRIPT_ATTEMPTS
+        ).lt("last_attempted_at", threshold).execute()
+        sb.table("transcripts").update(
+            {"processing_status": _STATUS_PENDING_COMPLETION}
+        ).eq("processing_status", "in_progress").lt(
+            "attempt_count", _MAX_TRANSCRIPT_ATTEMPTS
+        ).is_("last_attempted_at", "null").execute()
     except Exception:
         log.exception("Failed to release stale in_progress transcripts")
 
@@ -169,14 +177,14 @@ def _release_stale_in_progress(sb) -> None:
 def _fetch_pending_transcripts(
     sb, *, limit: int = _DEFAULT_TRANSCRIPT_BATCH_LIMIT
 ) -> List[Dict[str, Any]]:
-    """Return pending transcripts still under the attempt cap, capped at `limit`."""
+    """Return pending and pending_completion transcripts under the attempt cap."""
     resp = (
         sb.table("transcripts")
         .select(
             "video_id, transcript_id, cleaned_transcript_txt, "
             "processing_status, attempt_count"
         )
-        .eq("processing_status", "pending")
+        .in_("processing_status", [_STATUS_PENDING, _STATUS_PENDING_COMPLETION])
         .lt("attempt_count", _MAX_TRANSCRIPT_ATTEMPTS)
         .order("created_at", desc=False)
         .order("transcript_id", desc=False)
@@ -184,6 +192,39 @@ def _fetch_pending_transcripts(
         .execute()
     )
     return list(resp.data or [])
+
+
+def _insight_queue_counts(sb) -> tuple[int, int]:
+    """Return (pending, pending_completion) rows under the insight attempt cap."""
+
+    def _count_for_status(status: str) -> int:
+        r = (
+            sb.table("transcripts")
+            .select("transcript_id", count="exact")
+            .eq("processing_status", status)
+            .lt("attempt_count", _MAX_TRANSCRIPT_ATTEMPTS)
+            .execute()
+        )
+        c = getattr(r, "count", None)
+        return int(c) if c is not None else 0
+
+    return _count_for_status(_STATUS_PENDING), _count_for_status(
+        _STATUS_PENDING_COMPLETION
+    )
+
+
+def _format_idle_summary(n_pending: int, n_pending_completion: int) -> tuple[str, str]:
+    """Short log line and a small aligned block for empty-queue outcomes."""
+    message = (
+        f"No insight work queued (pending={n_pending}, "
+        f"pending_completion={n_pending_completion})."
+    )
+    summary = (
+        "LLM insight pipeline — idle\n"
+        f"  pending:              {n_pending}\n"
+        f"  pending_completion:   {n_pending_completion}"
+    )
+    return message, summary
 
 
 def _mark_transcript_in_progress(sb, transcript_id: str, attempt_count: int) -> None:
@@ -204,19 +245,21 @@ def _mark_transcript_done(sb, transcript_id: str) -> None:
     ).execute()
 
 
-def _reset_transcript_to_pending(sb, transcript_id: str) -> None:
-    """Reset transcript to pending so future invocations can retry.
+def _reset_transcript_for_retry(sb, transcript_id: str) -> None:
+    """Set transcript to pending_completion so the next run can merge without wiping.
 
-    Used when an attempt fails or yields no claims. Without a `failed` state,
-    this prevents rows from being stranded in `in_progress` after Lambda
-    interruptions while keeping retries idempotent.
+    Used when an attempt fails after entering in_progress. Without a `failed`
+    state, this avoids rows stuck in `in_progress` and avoids treating the job
+    as a brand-new ingest (pending), which would replace all claims.
     """
     try:
-        sb.table("transcripts").update({"processing_status": "pending"}).eq(
-            "transcript_id", transcript_id
-        ).execute()
+        sb.table("transcripts").update(
+            {"processing_status": _STATUS_PENDING_COMPLETION}
+        ).eq("transcript_id", transcript_id).execute()
     except Exception:
-        log.exception("Failed to reset transcript %s to pending", transcript_id)
+        log.exception(
+            "Failed to reset transcript %s to pending_completion", transcript_id
+        )
 
 
 def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
@@ -241,8 +284,49 @@ def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Replace existing transcript claims
+# 2. Replace or merge transcript claims
 # ---------------------------------------------------------------------------
+
+
+def _fetch_existing_claim_texts(sb, transcript_id: str) -> set[str]:
+    """Claim texts already stored for this transcript (exact string match)."""
+    resp = (
+        sb.table("claims")
+        .select("claim_text")
+        .eq("transcript_id", transcript_id)
+        .execute()
+    )
+    return {r["claim_text"] for r in (resp.data or []) if r.get("claim_text")}
+
+
+def _filter_new_claims_for_resume(
+    existing_texts: set[str],
+    claims: List[Dict[str, Any]],
+    decisions: List[MatchDecision],
+) -> tuple[List[Dict[str, Any]], List[MatchDecision]]:
+    """Drop claims already persisted so a retry only inserts missing rows."""
+    new_claims: List[Dict[str, Any]] = []
+    new_decisions: List[MatchDecision] = []
+    for c, d in zip(claims, decisions):
+        if c["text"] in existing_texts:
+            continue
+        new_claims.append(c)
+        new_decisions.append(d)
+    return new_claims, new_decisions
+
+
+def _new_narratives_from_decisions(
+    decisions: List[MatchDecision],
+) -> List[NarrativeCandidate]:
+    """Narrative candidates to insert for this claim subset, deduped by id."""
+    out: List[NarrativeCandidate] = []
+    seen: set[uuid.UUID] = set()
+    for d in decisions:
+        nn = d.new_narrative
+        if nn is not None and nn.narrative_id not in seen:
+            seen.add(nn.narrative_id)
+            out.append(nn)
+    return out
 
 
 def _delete_existing_insights(sb, transcript_id: str) -> None:
@@ -586,13 +670,20 @@ def run_llm_insight_generation_pipeline(
 
     transcripts = _fetch_pending_transcripts(sb)
     if not transcripts:
-        log.info("No pending transcripts found.")
+        n_p, n_pc = _insight_queue_counts(sb)
+        message, summary = _format_idle_summary(n_p, n_pc)
+        log.info("%s\n%s", message, summary)
         return {
             "video_ids": [],
             "total_claims": 0,
             "total_new_narratives": 0,
             "stopped_early": False,
-            "reason": None,
+            "idle": True,
+            "reason": "no_queued_transcripts",
+            "message": message,
+            "summary": summary,
+            "queued_pending": n_p,
+            "queued_pending_completion": n_pc,
             "last_completed_transcript_id": None,
             "next_transcript_id": None,
             "remaining_ms": _get_remaining_ms(lambda_context),
@@ -623,6 +714,7 @@ def run_llm_insight_generation_pipeline(
                 "total_claims": total_claims,
                 "total_new_narratives": total_new_narratives,
                 "stopped_early": True,
+                "idle": False,
                 "reason": "time_budget",
                 "last_completed_transcript_id": last_completed_transcript_id,
                 "next_transcript_id": next_transcript_id,
@@ -634,6 +726,7 @@ def run_llm_insight_generation_pipeline(
         transcript_id = str(t["transcript_id"])
         text = t["cleaned_transcript_txt"]
         current_attempts = int(t.get("attempt_count") or 0)
+        entry_status = str(t.get("processing_status") or _STATUS_PENDING)
 
         try:
             _mark_transcript_in_progress(sb, transcript_id, current_attempts)
@@ -676,29 +769,51 @@ def run_llm_insight_generation_pipeline(
                         embedder=embedder,
                     )
 
-            # Only clear prior insights now that extraction has succeeded and
-            # we have new claims ready to persist.
-            _delete_existing_insights(sb, transcript_id)
+            if entry_status == _STATUS_PENDING_COMPLETION:
+                existing_texts = _fetch_existing_claim_texts(sb, transcript_id)
+                claims_to_save, decisions_to_save = _filter_new_claims_for_resume(
+                    existing_texts, claims, decisions
+                )
+                narr_to_save = _new_narratives_from_decisions(decisions_to_save)
+                log.info(
+                    "%s: resume merge — %d new claim(s) of %d extracted",
+                    video_id,
+                    len(claims_to_save),
+                    len(claims),
+                )
+            else:
+                claims_to_save = claims
+                decisions_to_save = decisions
+                narr_to_save = run_new_narratives
+                # Fresh pending ingest: replace prior snapshot after successful extract.
+                _delete_existing_insights(sb, transcript_id)
 
-            inserted = _persist_insights(
-                sb, video_id, transcript_id, claims, decisions, run_new_narratives
-            )
+            inserted = 0
+            if claims_to_save:
+                inserted = _persist_insights(
+                    sb,
+                    video_id,
+                    transcript_id,
+                    claims_to_save,
+                    decisions_to_save,
+                    narr_to_save,
+                )
             _mark_transcript_done(sb, transcript_id)
             total_claims += inserted
-            total_new_narratives += len(run_new_narratives)
+            total_new_narratives += len(narr_to_save)
             processed_video_ids.append(video_id)
             last_completed_transcript_id = transcript_id
             log.info(
                 "%s: %d claims, %d new narratives",
                 video_id,
                 inserted,
-                len(run_new_narratives),
+                len(narr_to_save),
             )
         except Exception:
             log.exception("Failed to process %s", video_id)
-            # Without a dedicated `failed` state, reset to pending so the next
-            # invocation can retry rather than leaving the row stuck in-progress.
-            _reset_transcript_to_pending(sb, transcript_id)
+            # Without a dedicated `failed` state, use pending_completion so the next
+            # run can retry without wiping claims already written.
+            _reset_transcript_for_retry(sb, transcript_id)
 
     remaining_ms = _get_remaining_ms(lambda_context)
     return {
@@ -706,6 +821,7 @@ def run_llm_insight_generation_pipeline(
         "total_claims": total_claims,
         "total_new_narratives": total_new_narratives,
         "stopped_early": False,
+        "idle": False,
         "reason": None,
         "last_completed_transcript_id": last_completed_transcript_id,
         "next_transcript_id": None,
