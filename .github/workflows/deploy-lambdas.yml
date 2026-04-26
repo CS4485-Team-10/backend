@@ -24,31 +24,28 @@ jobs:
         shell: bash --noprofile --norc -eo pipefail {0}
     strategy:
       fail-fast: false
+      # One name for both: Lambda `function_name` and ECR repository (must match AWS).
       matrix:
         include:
-          - lambda_name: yt-data-ingestion-lambda
-            ecr_repo: yt-data-ingestion
+          - id: yt-ingestion
             dockerfile: docker/Dockerfile.yt
             deploy_name: "1 of 4 — YouTube data ingestion"
-            deploy_desc: "Builds the image for YouTube search, video metadata, and saving transcripts to the database (matches yt-data-ingestion-lambda)."
+            deploy_desc: "Builds the image for YouTube search, video metadata, and saving transcripts to the database (matches Lambda yt-ingestion and ECR repo yt-ingestion)."
 
-          - lambda_name: sentiment-analysis-lambda
-            ecr_repo: sentiment-analysis
+          - id: sentiment-analysis
             dockerfile: docker/Dockerfile.sentiment
             deploy_name: "2 of 4 — Sentiment analysis"
-            deploy_desc: "Builds the image for per-video sentiment (transformer model inside the image; matches sentiment-analysis-lambda)."
+            deploy_desc: "Builds the image for per-video sentiment (transformer model inside the image; matches Lambda sentiment-analysis and ECR repo sentiment-analysis)."
 
-          - lambda_name: misinfo-checker-lambda
-            ecr_repo: misinfo-checker
+          - id: misinfo-checker
             dockerfile: docker/Dockerfile.misinfo
             deploy_name: "3 of 4 — Misinformation checks"
-            deploy_desc: "Builds the image for claim-level misinformation and risk analysis (matches misinfo-checker-lambda)."
+            deploy_desc: "Builds the image for claim-level misinformation and risk analysis (matches Lambda misinfo-checker and ECR repo misinfo-checker)."
 
-          - lambda_name: llm-insight-generation-lambda
-            ecr_repo: llm-insight-generation
+          - id: llm-insight-generation
             dockerfile: docker/Dockerfile.llm
             deploy_name: "4 of 4 — LLM insight generation"
-            deploy_desc: "Builds the image for claim extraction, narrative matching, and LLM/Bedrock-backed insights (matches llm-insight-generation-lambda)."
+            deploy_desc: "Builds the image for claim extraction, narrative matching, and LLM/Bedrock-backed insights (matches Lambda llm-insight-generation and ECR repo llm-insight-generation)."
 
     steps:
       - name: Checkout
@@ -69,17 +66,17 @@ jobs:
           set -x
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           IMAGE_TAG=${GITHUB_SHA}
-          IMAGE_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ matrix.ecr_repo }}:${IMAGE_TAG}
+          IMAGE_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ matrix.id }}:${IMAGE_TAG}
 
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
 
           {
-            echo "### ${{ matrix.lambda_name }}"
+            echo "### ${{ matrix.id }}"
             echo ""
             echo "| | |"
             echo "|---|---|"
             echo "| Region | \`${AWS_REGION}\` |"
-            echo "| ECR repository | \`${{ matrix.ecr_repo }}\` |"
+            echo "| ECR repository (same as Lambda \`id\`) | \`${{ matrix.id }}\` |"
             echo "| Dockerfile | \`${{ matrix.dockerfile }}\` |"
             echo "| Image tag | \`${IMAGE_TAG}\` |"
             echo "| Image platform | \`linux/amd64\` (x86_64) |"
@@ -96,8 +93,8 @@ jobs:
             echo "================================================================================"
             echo "${{ matrix.deploy_desc }}"
             echo "This step compiles a linux/amd64 (x86_64) image from ${{ matrix.dockerfile }} so it runs on a typical x86_64 Lambda."
-            echo "ECR repository (target for the next step): ${{ matrix.ecr_repo }}"
-            echo "Lambda function to update (after push):   ${{ matrix.lambda_name }}"
+            echo "ECR repository (target for the next step): ${{ matrix.id }}"
+            echo "Lambda function to update (after push):   ${{ matrix.id }}"
             echo "================================================================================"
             echo ""
           }
@@ -118,7 +115,7 @@ jobs:
             echo "PUSH TO AMAZON ECR  —  ${{ matrix.deploy_name }}"
             echo "================================================================================"
             echo "Uploads the image built above to ECR. Lambda functions pull this image at deploy time, not at build time on your laptop."
-            echo "Repository: ${{ matrix.ecr_repo }}"
+            echo "Repository: ${{ matrix.id }}"
             echo "Image URI:  ${{ steps.vars.outputs.image_uri }}"
             echo "Tag:        ${GITHUB_SHA} (the commit that triggered this run)"
             echo "================================================================================"
@@ -135,7 +132,7 @@ jobs:
             echo "UPDATE LAMBDA FUNCTION  —  ${{ matrix.deploy_name }}"
             echo "================================================================================"
             echo "Tells AWS to use the new ECR image for the live function. The next run (or any invoke) will use this container."
-            echo "Function name: ${{ matrix.lambda_name }}"
+            echo "Function name: ${{ matrix.id }}"
             echo "Image URI:     ${{ steps.vars.outputs.image_uri }}"
             echo "Region:        ${AWS_REGION}"
             echo "================================================================================"
@@ -143,29 +140,28 @@ jobs:
           }
           set -x
           aws lambda update-function-code \
-            --function-name "${{ matrix.lambda_name }}" \
+            --function-name "${{ matrix.id }}" \
             --image-uri "${{ steps.vars.outputs.image_uri }}"
 
       - name: Wait for update
         run: |
           set -x
           aws lambda wait function-updated \
-            --function-name "${{ matrix.lambda_name }}"
+            --function-name "${{ matrix.id }}"
 
       - name: Failure diagnostics
         if: failure()
         run: |
-          echo "::error::Deploy failed for ${{ matrix.lambda_name }} — see logs above for the first failing command."
+          echo "::error::Deploy failed for ${{ matrix.id }} — see logs above for the first failing command."
           echo "::group::Deploy context"
-          echo "Lambda: ${{ matrix.lambda_name }}"
-          echo "ECR repo: ${{ matrix.ecr_repo }}"
+          echo "Lambda / ECR name: ${{ matrix.id }}"
           echo "Dockerfile: ${{ matrix.dockerfile }}"
           echo "Region: ${AWS_REGION}"
           echo "Commit: ${GITHUB_SHA}"
           echo "::endgroup::"
           echo "::group::Lambda configuration (may explain update/runtime issues)"
           aws lambda get-function-configuration \
-            --function-name "${{ matrix.lambda_name }}" \
+            --function-name "${{ matrix.id }}" \
             --output json \
             --query '{
               LastModified: LastModified,
