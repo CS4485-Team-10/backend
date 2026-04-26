@@ -383,7 +383,11 @@ def match_claim_to_narratives(
             linked_narrative_ids=[new_narr.narrative_id], new_narrative=new_narr
         )
 
-    query = claim_text if not narrative_theme else f"{claim_text} — {narrative_theme}"
+    query = (
+        f"{narrative_theme} — {narrative_category}"
+        if narrative_theme and narrative_category
+        else narrative_theme or claim_text
+    )
     query_vec = embedder.encode([query])[0]
     sims = cosine_sim(query_vec, candidate_embeddings)
 

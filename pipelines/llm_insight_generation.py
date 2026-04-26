@@ -404,21 +404,42 @@ Rules:
 - Prefer concise, normalized wording over dramatic or conversational phrasing
 
 Rules for generating narrative metadata:
-- "narrative_theme" must be a short topic label, not a sentence
-- Make "narrative_theme" reusable across multiple similar claims
-- Focus on the underlying health topic, not the speaker, tone, or sequence
-- Avoid generic labels like "Personal History", "Initial Effects", "Long-term Effects", "Encouragement"
-- Avoid overly narrow labels that only fit one claim
 
-- "narrative_category" must be a coarse reusable health bucket such as:
+- "narrative_theme" must be a short, normalized topic label (not a sentence)
+- Make "narrative_theme" broadly reusable across many claims, transcripts, and videos
+- Focus on the underlying health concept, not specific examples, foods, people, or scenarios
+- Prefer canonical phrasing (e.g., "Sleep Deprivation Risks" instead of "Lack of Sleep Effects on Energy")
+
+- Avoid generic labels like "Personal History", "Initial Effects", "Long-term Effects", "Encouragement"
+- Avoid overly narrow or claim-specific labels that only fit one example
+
+CLUSTERING AND REUSE:
+- Narrative metadata should group multiple related claims into the same broader theme
+- Multiple claims in the same transcript SHOULD reuse the exact same narrative metadata when appropriate
+- Prefer reusing an existing theme rather than creating a new one when the underlying health idea is similar
+- Do NOT create a new narrative_theme just because the claim mentions a different:
+  - food (e.g., blueberries vs kiwi)
+  - symptom
+  - intervention
+  - mechanism
+- Instead, abstract to the shared concept (e.g., "Nutrition and Eye Health")
+
+ABSTRACTION LEVEL:
+- A narrative_theme should represent a general health pattern, not a specific instance
+- It should typically be broad enough to apply to multiple videos and multiple claims
+- If two claims differ only in example or detail, they should share the same narrative_theme
+
+- "narrative_category" must be a coarse, reusable health bucket such as:
   Sleep, Mental Health, Vaccines, Chronic Disease, Healthcare Systems, Nutrition, Medications, Public Health, Addiction, Endocrine Health
 - Use "Uncategorized" only if no reasonable category fits
 
-- "narrative_description" should be a concise 1-2 sentence summary of the broader health narrative
-- "narrative_details" should be a slightly richer explanation of the types of claims, mechanisms, risks, or health ideas that belong under that narrative
-- Do not make description/details speaker-specific
-- Do not make description/details motivational or vague
-- Keep both description and details generalizable and health-relevant
+- "narrative_description" should be a concise 1–2 sentence summary of the broader health narrative
+- "narrative_details" should expand on mechanisms, risks, or types of claims that belong under this narrative
+
+- Description and details must:
+  - remain generalizable (not tied to a specific person, story, or example)
+  - avoid motivational, anecdotal, or vague language
+  - describe the broader health idea, not the specific claim wording
 
 Good examples of narrative_theme:
 - Sleep Deprivation Risks

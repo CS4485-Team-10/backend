@@ -1058,7 +1058,7 @@ def run_youtube_data_ingestion_pipeline(
     min_views: int = 1500,
     min_like_count: int = 50,
     min_comment_count: int = 10,
-    percentile: float = 0.65,
+    percentile: float = 0.75,
     min_duration_seconds: int = 120,
     quota_budget: Optional[int] = None,
     verbose: bool = True,
