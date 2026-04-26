@@ -59,9 +59,7 @@ def _agent_debug_log(
 # Source: https://developers.google.com/youtube/v3/determine_quota_cost
 _QUOTA_COST_SEARCH_LIST = 100
 _QUOTA_COST_VIDEOS_LIST = 1
-
-_DEFAULT_QUOTA_BUDGET = 9000  # keep a 1000-unit buffer under the 10,000/day default
-
+_DEFAULT_QUOTA_BUDGET = 9500  # keep a 500-unit buffer under the 10,000/day default
 _DEFAULT_SEARCH_QUERIES = [
     "personal mental health",
     "personal fitness health journey",
@@ -268,8 +266,23 @@ STRICTLY EXCLUDE:
 - Vague wellness claims without clear mechanism or evidence
 - Non-health content (e.g., hobbies, possessions, general life updates)
 
+HARD GATE (must satisfy to be relevant):
+The video MUST contain at least one of the following:
+- explanation of a health concept, mechanism, or condition
+- generalizable advice that applies beyond the individual
+- discussion of risk factors, causes, or prevention
+- structured educational or informational content
+
+If the video is primarily:
+- a personal journey (fitness, weight loss, recovery, pregnancy, etc.)
+- lifestyle documentation (“day in my life”, routines, habits)
+- emotional reflection or storytelling
+
+→ then it is NOT relevant, even if it mentions health topics.
+
 IMPORTANT RETRIEVAL CONTEXT:
 These videos were retrieved using health-related search queries. Treat alignment with the search intent as positive evidence of relevance.
+Query alignment is weak evidence; the HARD GATE is stronger and must override query alignment.
 If a video is about a health-related topic represented by the query context — such as sleep, pregnancy, nutrition, exercise, chronic illness, preventive health, or mental health — it should generally be considered relevant IF the content appears generalizable, educational, explanatory, or broadly informative.
 Do NOT require the video to explicitly mention "public health" or be framed at a population-policy level.
 
