@@ -108,13 +108,13 @@ def executive_overview(session: Session = Depends(get_session)):
     verified_claims = session.exec(
         select(func.count())
         .select_from(Claim)
-        .where(col(Claim.fact_check_status).ilike("verified"))
+        .where(col(Claim.fact_check_status).ilike("verified%"))
     ).one()
 
     disputed_claims = session.exec(
         select(func.count())
         .select_from(Claim)
-        .where(col(Claim.fact_check_status).ilike("disputed"))
+        .where(col(Claim.fact_check_status).ilike("disputed%"))
     ).one()
 
     checked_total = verified_claims + disputed_claims
