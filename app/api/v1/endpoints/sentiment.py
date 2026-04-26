@@ -13,8 +13,7 @@ modify any existing shared module.
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Query
 from supabase import create_client
@@ -43,7 +42,7 @@ _RANGE_CONFIG: dict[str, tuple[int, int]] = {
 }
 
 
-def _normalize_sentiment_label(raw: Optional[str]) -> Optional[str]:
+def _normalize_sentiment_label(raw: str | None) -> str | None:
     """Map misinfo_checker's labels (POSITIVE / NEGATIVE / NEUTRAL) to
     canonical lowercase keys. Tolerant of stray casing / variants."""
     if raw is None:
@@ -58,7 +57,7 @@ def _normalize_sentiment_label(raw: Optional[str]) -> Optional[str]:
     return None
 
 
-def _parse_created_at(raw: Optional[str]) -> Optional[datetime]:
+def _parse_created_at(raw: str | None) -> datetime | None:
     """Supabase returns timestamps as ISO strings; normalize to UTC datetime."""
     if not raw:
         return None
@@ -67,8 +66,8 @@ def _parse_created_at(raw: Optional[str]) -> Optional[datetime]:
     except (ValueError, TypeError):
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 @router.get("/overview/sentiment-shift", response_model=SentimentShiftResponse)
@@ -89,7 +88,10 @@ def sentiment_shift(
         raise HTTPException(status_code=503, detail="Supabase not configured")
 
     window_days, bucket_size_days = _RANGE_CONFIG[range_]
-    now = datetime.now(timezone.utc)
+    # Truncate to midnight UTC so bucket boundaries fall on calendar dates,
+    # preventing a single day's claims from being split across two buckets
+    # when the window boundary lands mid-day.
+    now = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     window_start = now - timedelta(days=window_days)
 
     sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
