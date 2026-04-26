@@ -23,10 +23,9 @@ log = logging.getLogger(__name__)
 # Thresholds (overridable via env)
 # ---------------------------------------------------------------------------
 
-STRONG_MATCH: float = float(os.environ.get("NARR_STRONG_MATCH", "0.82"))
-MULTI_LINK_THRESHOLD: float = float(os.environ.get("NARR_MULTI_LINK", "0.70"))
-NEW_NARRATIVE_MIN: float = float(os.environ.get("NARR_NEW_MIN", "0.72"))
-MAX_NARRATIVES_PER_CLAIM: int = int(os.environ.get("NARR_MAX_PER_CLAIM", "5"))
+MULTI_LINK_THRESHOLD: float = float(os.environ.get("NARR_MULTI_LINK", "0.68"))
+NEW_NARRATIVE_MIN: float = float(os.environ.get("NARR_NEW_MIN", "0.68"))
+MAX_NARRATIVES_PER_CLAIM: int = int(os.environ.get("NARR_MAX_PER_CLAIM", "3"))
 
 _DEFAULT_EMBEDDING_TIMEOUT = 60.0
 _DEFAULT_BEDROCK_EMBEDDING_MODEL = "amazon.titan-embed-text-v2:0"
