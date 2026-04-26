@@ -8,8 +8,10 @@ from app.api.v1.endpoints import (
     health,
     ingest,
     narratives,
+    notify,
     overview,
     sentiment,
+    subscribers,
     supabase_ping,
     transcripts,
     videos,
@@ -28,3 +30,5 @@ api_router.include_router(transcripts.router, tags=["transcripts"])
 api_router.include_router(ingest.router, tags=["ingest"])
 api_router.include_router(creators.router, tags=["creators"])
 api_router.include_router(alerts.router, tags=["alerts"])
+api_router.include_router(notify.router, tags=["notify"])
+api_router.include_router(subscribers.router, tags=["subscribers"])
