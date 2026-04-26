@@ -43,7 +43,9 @@ _DEFAULT_IN_PROGRESS_STALE_MINUTES = 30
 
 # Fresh work from ingestion — safe to replace any existing claims for this transcript.
 _STATUS_PENDING = "pending"
-# Retry after Lambda timeout / crash / failed attempt — merge new claims only; never wipe.
+# Retry after Lambda timeout / crash / failed attempt — on the next successful run,
+# clear this transcript's existing claims and claim_narratives rows and re-insert
+# from the fresh extraction. Shared `narratives` rows are never touched.
 _STATUS_PENDING_COMPLETION = "pending_completion"
 
 # Defensive max lengths for parsed LLM fields (downstream of JSON only; prompts unchanged).
@@ -152,8 +154,9 @@ def _get_stale_in_progress_threshold_utc() -> datetime:
 def _release_stale_in_progress(sb) -> None:
     """Move stale in_progress rows to pending_completion so they can be retried.
 
-    Uses pending_completion (not pending) so the insight job can merge new rows
-    without deleting claims that may already have been persisted before timeout.
+    Uses pending_completion (not pending) so the next successful run knows to
+    clear any partial claim/claim_narrative rows for the transcript before
+    re-persisting; partial rows are left in place until that successful retry.
 
     Does not change attempt_count. Only rows still under the attempt cap are
     touched so retry-capped transcripts remain excluded.
@@ -246,11 +249,12 @@ def _mark_transcript_done(sb, transcript_id: str) -> None:
 
 
 def _reset_transcript_for_retry(sb, transcript_id: str) -> None:
-    """Set transcript to pending_completion so the next run can merge without wiping.
+    """Set transcript to pending_completion so the next run will retry it.
 
     Used when an attempt fails after entering in_progress. Without a `failed`
-    state, this avoids rows stuck in `in_progress` and avoids treating the job
-    as a brand-new ingest (pending), which would replace all claims.
+    state, this avoids rows stuck in `in_progress`. Existing partial claims
+    are intentionally left untouched here; the next successful attempt clears
+    them as part of its persist step (see the orchestration loop).
     """
     try:
         sb.table("transcripts").update(
@@ -284,49 +288,8 @@ def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Replace or merge transcript claims
+# 2. Replace transcript claims
 # ---------------------------------------------------------------------------
-
-
-def _fetch_existing_claim_texts(sb, transcript_id: str) -> set[str]:
-    """Claim texts already stored for this transcript (exact string match)."""
-    resp = (
-        sb.table("claims")
-        .select("claim_text")
-        .eq("transcript_id", transcript_id)
-        .execute()
-    )
-    return {r["claim_text"] for r in (resp.data or []) if r.get("claim_text")}
-
-
-def _filter_new_claims_for_resume(
-    existing_texts: set[str],
-    claims: List[Dict[str, Any]],
-    decisions: List[MatchDecision],
-) -> tuple[List[Dict[str, Any]], List[MatchDecision]]:
-    """Drop claims already persisted so a retry only inserts missing rows."""
-    new_claims: List[Dict[str, Any]] = []
-    new_decisions: List[MatchDecision] = []
-    for c, d in zip(claims, decisions):
-        if c["text"] in existing_texts:
-            continue
-        new_claims.append(c)
-        new_decisions.append(d)
-    return new_claims, new_decisions
-
-
-def _new_narratives_from_decisions(
-    decisions: List[MatchDecision],
-) -> List[NarrativeCandidate]:
-    """Narrative candidates to insert for this claim subset, deduped by id."""
-    out: List[NarrativeCandidate] = []
-    seen: set[uuid.UUID] = set()
-    for d in decisions:
-        nn = d.new_narrative
-        if nn is not None and nn.narrative_id not in seen:
-            seen.add(nn.narrative_id)
-            out.append(nn)
-    return out
 
 
 def _delete_existing_insights(sb, transcript_id: str) -> None:
@@ -733,8 +696,10 @@ def run_llm_insight_generation_pipeline(
 
             claims = _extract_claims(text, prov)
             if not claims:
-                # Extraction succeeded but yielded nothing. Preserve any prior
-                # insights and mark the transcript done so we don't loop on it.
+                if entry_status == _STATUS_PENDING_COMPLETION:
+                    # Confirmed empty result on retry: clear any partial rows
+                    # left over from an earlier failed attempt before completing.
+                    _delete_existing_insights(sb, transcript_id)
                 log.info("%s: 0 claims extracted, marking done.", video_id)
                 _mark_transcript_done(sb, transcript_id)
                 processed_video_ids.append(video_id)
@@ -769,50 +734,34 @@ def run_llm_insight_generation_pipeline(
                         embedder=embedder,
                     )
 
-            if entry_status == _STATUS_PENDING_COMPLETION:
-                existing_texts = _fetch_existing_claim_texts(sb, transcript_id)
-                claims_to_save, decisions_to_save = _filter_new_claims_for_resume(
-                    existing_texts, claims, decisions
-                )
-                narr_to_save = _new_narratives_from_decisions(decisions_to_save)
-                log.info(
-                    "%s: resume merge — %d new claim(s) of %d extracted",
-                    video_id,
-                    len(claims_to_save),
-                    len(claims),
-                )
-            else:
-                claims_to_save = claims
-                decisions_to_save = decisions
-                narr_to_save = run_new_narratives
-                # Fresh pending ingest: replace prior snapshot after successful extract.
-                _delete_existing_insights(sb, transcript_id)
-
-            inserted = 0
-            if claims_to_save:
-                inserted = _persist_insights(
-                    sb,
-                    video_id,
-                    transcript_id,
-                    claims_to_save,
-                    decisions_to_save,
-                    narr_to_save,
-                )
+            # Extract + match succeeded. For both `pending` and `pending_completion`
+            # clear this transcript's prior claim and claim_narrative rows before
+            # persisting the fresh result. Shared `narratives` rows are not touched.
+            _delete_existing_insights(sb, transcript_id)
+            inserted = _persist_insights(
+                sb,
+                video_id,
+                transcript_id,
+                claims,
+                decisions,
+                run_new_narratives,
+            )
             _mark_transcript_done(sb, transcript_id)
             total_claims += inserted
-            total_new_narratives += len(narr_to_save)
+            total_new_narratives += len(run_new_narratives)
             processed_video_ids.append(video_id)
             last_completed_transcript_id = transcript_id
             log.info(
                 "%s: %d claims, %d new narratives",
                 video_id,
                 inserted,
-                len(narr_to_save),
+                len(run_new_narratives),
             )
         except Exception:
             log.exception("Failed to process %s", video_id)
-            # Without a dedicated `failed` state, use pending_completion so the next
-            # run can retry without wiping claims already written.
+            # Without a dedicated `failed` state, set pending_completion so the next
+            # run will retry. Existing partial rows are intentionally left in place;
+            # the next successful attempt clears them before persisting fresh data.
             _reset_transcript_for_retry(sb, transcript_id)
 
     remaining_ms = _get_remaining_ms(lambda_context)
