@@ -92,15 +92,12 @@ def executive_overview(session: Session = Depends(get_session)):
             )
         ).all()
 
-        # Bucket into 2-week intervals
+        # Bucket by day
         buckets: dict[str, dict[str, int]] = defaultdict(
             lambda: {label: 0 for label in top_labels}
         )
         for created_at, label in rows:
-            bucket_start = ninety_days_ago + timedelta(
-                weeks=2 * ((created_at - ninety_days_ago).days // 14)
-            )
-            bucket_key = bucket_start.strftime("%Y-%m-%d")
+            bucket_key = created_at.strftime("%Y-%m-%d")
             buckets[bucket_key][label] += 1
 
         for date_key in sorted(buckets):
