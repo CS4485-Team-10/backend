@@ -46,7 +46,9 @@ class Settings(BaseSettings):
 
     YOUTUBE_API_KEY: str = ""
     YOUTUBE_DATA_API_KEY: str = ""
-    YOUTUBE_SEARCH_QUERY: str = ""
+
+    YOUTUBE_TRANSCRIPT_PROXY_USERNAME: str = ""
+    YOUTUBE_TRANSCRIPT_PROXY_PASSWORD: str = ""
 
     LLM_PROVIDER: str = ""
     LLM_MODEL: str = ""

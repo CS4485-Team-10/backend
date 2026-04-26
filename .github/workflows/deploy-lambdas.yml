@@ -1,0 +1,179 @@
+name: Deploy pipeline Lambdas
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pipelines/**"
+      - "docker/**"
+      - ".github/workflows/deploy-lambdas.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash --noprofile --norc -eo pipefail {0}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lambda_name: yt-data-ingestion-lambda
+            ecr_repo: yt-data-ingestion
+            dockerfile: docker/Dockerfile.yt
+            deploy_name: "1 of 4 — YouTube data ingestion"
+            deploy_desc: "Builds the image for YouTube search, video metadata, and saving transcripts to the database (matches yt-data-ingestion-lambda)."
+
+          - lambda_name: sentiment-analysis-lambda
+            ecr_repo: sentiment-analysis
+            dockerfile: docker/Dockerfile.sentiment
+            deploy_name: "2 of 4 — Sentiment analysis"
+            deploy_desc: "Builds the image for per-video sentiment (transformer model inside the image; matches sentiment-analysis-lambda)."
+
+          - lambda_name: misinfo-checker-lambda
+            ecr_repo: misinfo-checker
+            dockerfile: docker/Dockerfile.misinfo
+            deploy_name: "3 of 4 — Misinformation checks"
+            deploy_desc: "Builds the image for claim-level misinformation and risk analysis (matches misinfo-checker-lambda)."
+
+          - lambda_name: llm-insight-generation-lambda
+            ecr_repo: llm-insight-generation
+            dockerfile: docker/Dockerfile.llm
+            deploy_name: "4 of 4 — LLM insight generation"
+            deploy_desc: "Builds the image for claim extraction, narrative matching, and LLM/Bedrock-backed insights (matches llm-insight-generation-lambda)."
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image URI
+        id: vars
+        run: |
+          set -x
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          IMAGE_TAG=${GITHUB_SHA}
+          IMAGE_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ matrix.ecr_repo }}:${IMAGE_TAG}
+
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### ${{ matrix.lambda_name }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Region | \`${AWS_REGION}\` |"
+            echo "| ECR repository | \`${{ matrix.ecr_repo }}\` |"
+            echo "| Dockerfile | \`${{ matrix.dockerfile }}\` |"
+            echo "| Image tag | \`${IMAGE_TAG}\` |"
+            echo "| Image platform | \`linux/amd64\` (x86_64) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build image
+        env:
+          DOCKER_BUILDKIT: 1
+        run: |
+          {
+            echo ""
+            echo "================================================================================"
+            echo "BUILD  —  ${{ matrix.deploy_name }}"
+            echo "================================================================================"
+            echo "${{ matrix.deploy_desc }}"
+            echo "This step compiles a linux/amd64 (x86_64) image from ${{ matrix.dockerfile }} so it runs on a typical x86_64 Lambda."
+            echo "ECR repository (target for the next step): ${{ matrix.ecr_repo }}"
+            echo "Lambda function to update (after push):   ${{ matrix.lambda_name }}"
+            echo "================================================================================"
+            echo ""
+          }
+          set -x
+          # linux/amd64: matches x86_64 Lambda; explicit so builds stay amd64 on any runner.
+          docker build \
+            --platform linux/amd64 \
+            --progress=plain \
+            -f "${{ matrix.dockerfile }}" \
+            -t "${{ steps.vars.outputs.image_uri }}" \
+            .
+
+      - name: Push image
+        run: |
+          {
+            echo ""
+            echo "================================================================================"
+            echo "PUSH TO AMAZON ECR  —  ${{ matrix.deploy_name }}"
+            echo "================================================================================"
+            echo "Uploads the image built above to ECR. Lambda functions pull this image at deploy time, not at build time on your laptop."
+            echo "Repository: ${{ matrix.ecr_repo }}"
+            echo "Image URI:  ${{ steps.vars.outputs.image_uri }}"
+            echo "Tag:        ${GITHUB_SHA} (the commit that triggered this run)"
+            echo "================================================================================"
+            echo ""
+          }
+          set -x
+          docker push "${{ steps.vars.outputs.image_uri }}"
+
+      - name: Update Lambda function to new image
+        run: |
+          {
+            echo ""
+            echo "================================================================================"
+            echo "UPDATE LAMBDA FUNCTION  —  ${{ matrix.deploy_name }}"
+            echo "================================================================================"
+            echo "Tells AWS to use the new ECR image for the live function. The next run (or any invoke) will use this container."
+            echo "Function name: ${{ matrix.lambda_name }}"
+            echo "Image URI:     ${{ steps.vars.outputs.image_uri }}"
+            echo "Region:        ${AWS_REGION}"
+            echo "================================================================================"
+            echo ""
+          }
+          set -x
+          aws lambda update-function-code \
+            --function-name "${{ matrix.lambda_name }}" \
+            --image-uri "${{ steps.vars.outputs.image_uri }}"
+
+      - name: Wait for update
+        run: |
+          set -x
+          aws lambda wait function-updated \
+            --function-name "${{ matrix.lambda_name }}"
+
+      - name: Failure diagnostics
+        if: failure()
+        run: |
+          echo "::error::Deploy failed for ${{ matrix.lambda_name }} — see logs above for the first failing command."
+          echo "::group::Deploy context"
+          echo "Lambda: ${{ matrix.lambda_name }}"
+          echo "ECR repo: ${{ matrix.ecr_repo }}"
+          echo "Dockerfile: ${{ matrix.dockerfile }}"
+          echo "Region: ${AWS_REGION}"
+          echo "Commit: ${GITHUB_SHA}"
+          echo "::endgroup::"
+          echo "::group::Lambda configuration (may explain update/runtime issues)"
+          aws lambda get-function-configuration \
+            --function-name "${{ matrix.lambda_name }}" \
+            --output json \
+            --query '{
+              LastModified: LastModified,
+              State: State,
+              StateReason: StateReason,
+              LastUpdateStatus: LastUpdateStatus,
+              LastUpdateStatusReason: LastUpdateStatusReason,
+              PackageType: PackageType,
+              Architectures: Architectures
+            }' || echo "(get-function-configuration failed — check IAM or function name.)"
+          echo "::endgroup::"

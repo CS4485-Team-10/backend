@@ -41,6 +41,13 @@ _DEFAULT_TRANSCRIPT_BATCH_LIMIT = 20
 _MAX_TRANSCRIPT_ATTEMPTS = 5
 _DEFAULT_IN_PROGRESS_STALE_MINUTES = 30
 
+# Fresh work from ingestion — safe to replace any existing claims for this transcript.
+_STATUS_PENDING = "pending"
+# Retry after Lambda timeout / crash / failed attempt — on the next successful run,
+# clear this transcript's existing claims and claim_narratives rows and re-insert
+# from the fresh extraction. Shared `narratives` rows are never touched.
+_STATUS_PENDING_COMPLETION = "pending_completion"
+
 # Defensive max lengths for parsed LLM fields (downstream of JSON only; prompts unchanged).
 _MAX_CLAIM_TEXT_CHARS = 100_000
 _MAX_NARRATIVE_THEME_CHARS = 500
@@ -145,23 +152,27 @@ def _get_stale_in_progress_threshold_utc() -> datetime:
 
 
 def _release_stale_in_progress(sb) -> None:
-    """Move stale in_progress rows back to pending so they can be retried.
+    """Move stale in_progress rows to pending_completion so they can be retried.
+
+    Uses pending_completion (not pending) so the next successful run knows to
+    clear any partial claim/claim_narrative rows for the transcript before
+    re-persisting; partial rows are left in place until that successful retry.
 
     Does not change attempt_count. Only rows still under the attempt cap are
     touched so retry-capped transcripts remain excluded.
     """
     threshold = _get_stale_in_progress_threshold_utc().isoformat()
     try:
-        sb.table("transcripts").update({"processing_status": "pending"}).eq(
-            "processing_status", "in_progress"
-        ).lt("attempt_count", _MAX_TRANSCRIPT_ATTEMPTS).lt(
-            "last_attempted_at", threshold
-        ).execute()
-        sb.table("transcripts").update({"processing_status": "pending"}).eq(
-            "processing_status", "in_progress"
-        ).lt("attempt_count", _MAX_TRANSCRIPT_ATTEMPTS).is_(
-            "last_attempted_at", "null"
-        ).execute()
+        sb.table("transcripts").update(
+            {"processing_status": _STATUS_PENDING_COMPLETION}
+        ).eq("processing_status", "in_progress").lt(
+            "attempt_count", _MAX_TRANSCRIPT_ATTEMPTS
+        ).lt("last_attempted_at", threshold).execute()
+        sb.table("transcripts").update(
+            {"processing_status": _STATUS_PENDING_COMPLETION}
+        ).eq("processing_status", "in_progress").lt(
+            "attempt_count", _MAX_TRANSCRIPT_ATTEMPTS
+        ).is_("last_attempted_at", "null").execute()
     except Exception:
         log.exception("Failed to release stale in_progress transcripts")
 
@@ -169,14 +180,14 @@ def _release_stale_in_progress(sb) -> None:
 def _fetch_pending_transcripts(
     sb, *, limit: int = _DEFAULT_TRANSCRIPT_BATCH_LIMIT
 ) -> List[Dict[str, Any]]:
-    """Return pending transcripts still under the attempt cap, capped at `limit`."""
+    """Return pending and pending_completion transcripts under the attempt cap."""
     resp = (
         sb.table("transcripts")
         .select(
             "video_id, transcript_id, cleaned_transcript_txt, "
             "processing_status, attempt_count"
         )
-        .eq("processing_status", "pending")
+        .in_("processing_status", [_STATUS_PENDING, _STATUS_PENDING_COMPLETION])
         .lt("attempt_count", _MAX_TRANSCRIPT_ATTEMPTS)
         .order("created_at", desc=False)
         .order("transcript_id", desc=False)
@@ -184,6 +195,39 @@ def _fetch_pending_transcripts(
         .execute()
     )
     return list(resp.data or [])
+
+
+def _insight_queue_counts(sb) -> tuple[int, int]:
+    """Return (pending, pending_completion) rows under the insight attempt cap."""
+
+    def _count_for_status(status: str) -> int:
+        r = (
+            sb.table("transcripts")
+            .select("transcript_id", count="exact")
+            .eq("processing_status", status)
+            .lt("attempt_count", _MAX_TRANSCRIPT_ATTEMPTS)
+            .execute()
+        )
+        c = getattr(r, "count", None)
+        return int(c) if c is not None else 0
+
+    return _count_for_status(_STATUS_PENDING), _count_for_status(
+        _STATUS_PENDING_COMPLETION
+    )
+
+
+def _format_idle_summary(n_pending: int, n_pending_completion: int) -> tuple[str, str]:
+    """Short log line and a small aligned block for empty-queue outcomes."""
+    message = (
+        f"No insight work queued (pending={n_pending}, "
+        f"pending_completion={n_pending_completion})."
+    )
+    summary = (
+        "LLM insight pipeline — idle\n"
+        f"  pending:              {n_pending}\n"
+        f"  pending_completion:   {n_pending_completion}"
+    )
+    return message, summary
 
 
 def _mark_transcript_in_progress(sb, transcript_id: str, attempt_count: int) -> None:
@@ -204,19 +248,22 @@ def _mark_transcript_done(sb, transcript_id: str) -> None:
     ).execute()
 
 
-def _reset_transcript_to_pending(sb, transcript_id: str) -> None:
-    """Reset transcript to pending so future invocations can retry.
+def _reset_transcript_for_retry(sb, transcript_id: str) -> None:
+    """Set transcript to pending_completion so the next run will retry it.
 
-    Used when an attempt fails or yields no claims. Without a `failed` state,
-    this prevents rows from being stranded in `in_progress` after Lambda
-    interruptions while keeping retries idempotent.
+    Used when an attempt fails after entering in_progress. Without a `failed`
+    state, this avoids rows stuck in `in_progress`. Existing partial claims
+    are intentionally left untouched here; the next successful attempt clears
+    them as part of its persist step (see the orchestration loop).
     """
     try:
-        sb.table("transcripts").update({"processing_status": "pending"}).eq(
-            "transcript_id", transcript_id
-        ).execute()
+        sb.table("transcripts").update(
+            {"processing_status": _STATUS_PENDING_COMPLETION}
+        ).eq("transcript_id", transcript_id).execute()
     except Exception:
-        log.exception("Failed to reset transcript %s to pending", transcript_id)
+        log.exception(
+            "Failed to reset transcript %s to pending_completion", transcript_id
+        )
 
 
 def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
@@ -241,7 +288,7 @@ def _fetch_all_narratives(sb) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Replace existing transcript claims
+# 2. Replace transcript claims
 # ---------------------------------------------------------------------------
 
 
@@ -357,21 +404,42 @@ Rules:
 - Prefer concise, normalized wording over dramatic or conversational phrasing
 
 Rules for generating narrative metadata:
-- "narrative_theme" must be a short topic label, not a sentence
-- Make "narrative_theme" reusable across multiple similar claims
-- Focus on the underlying health topic, not the speaker, tone, or sequence
-- Avoid generic labels like "Personal History", "Initial Effects", "Long-term Effects", "Encouragement"
-- Avoid overly narrow labels that only fit one claim
 
-- "narrative_category" must be a coarse reusable health bucket such as:
+- "narrative_theme" must be a short, normalized topic label (not a sentence)
+- Make "narrative_theme" broadly reusable across many claims, transcripts, and videos
+- Focus on the underlying health concept, not specific examples, foods, people, or scenarios
+- Prefer canonical phrasing (e.g., "Sleep Deprivation Risks" instead of "Lack of Sleep Effects on Energy")
+
+- Avoid generic labels like "Personal History", "Initial Effects", "Long-term Effects", "Encouragement"
+- Avoid overly narrow or claim-specific labels that only fit one example
+
+CLUSTERING AND REUSE:
+- Narrative metadata should group multiple related claims into the same broader theme
+- Multiple claims in the same transcript SHOULD reuse the exact same narrative metadata when appropriate
+- Prefer reusing an existing theme rather than creating a new one when the underlying health idea is similar
+- Do NOT create a new narrative_theme just because the claim mentions a different:
+  - food (e.g., blueberries vs kiwi)
+  - symptom
+  - intervention
+  - mechanism
+- Instead, abstract to the shared concept (e.g., "Nutrition and Eye Health")
+
+ABSTRACTION LEVEL:
+- A narrative_theme should represent a general health pattern, not a specific instance
+- It should typically be broad enough to apply to multiple videos and multiple claims
+- If two claims differ only in example or detail, they should share the same narrative_theme
+
+- "narrative_category" must be a coarse, reusable health bucket such as:
   Sleep, Mental Health, Vaccines, Chronic Disease, Healthcare Systems, Nutrition, Medications, Public Health, Addiction, Endocrine Health
 - Use "Uncategorized" only if no reasonable category fits
 
-- "narrative_description" should be a concise 1-2 sentence summary of the broader health narrative
-- "narrative_details" should be a slightly richer explanation of the types of claims, mechanisms, risks, or health ideas that belong under that narrative
-- Do not make description/details speaker-specific
-- Do not make description/details motivational or vague
-- Keep both description and details generalizable and health-relevant
+- "narrative_description" should be a concise 1–2 sentence summary of the broader health narrative
+- "narrative_details" should expand on mechanisms, risks, or types of claims that belong under this narrative
+
+- Description and details must:
+  - remain generalizable (not tied to a specific person, story, or example)
+  - avoid motivational, anecdotal, or vague language
+  - describe the broader health idea, not the specific claim wording
 
 Good examples of narrative_theme:
 - Sleep Deprivation Risks
@@ -462,13 +530,17 @@ def _extract_claims(
 def _get_provider_from_env() -> LLMProvider:
     """Build provider from environment settings."""
     provider_name = (os.environ.get("LLM_PROVIDER") or "ollama").lower()
-    model = os.environ.get("LLM_MODEL") or "qwen3"
     base_url = os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
 
     if provider_name == "ollama":
+        model = os.environ.get("LLM_MODEL") or "qwen3"
         return OllamaProvider(model=model, base_url=base_url)
     if provider_name == "bedrock":
-        return BedrockProvider(model=model)
+        # Full Bedrock modelId: use BEDROCK_MODEL, else LLM_MODEL, else library default
+        explicit = (
+            os.environ.get("BEDROCK_MODEL") or os.environ.get("LLM_MODEL") or ""
+        ).strip() or None
+        return BedrockProvider(model=explicit)
     raise ValueError(
         f"Unknown LLM_PROVIDER: {provider_name}. Use 'ollama' or 'bedrock'."
     )
@@ -582,13 +654,20 @@ def run_llm_insight_generation_pipeline(
 
     transcripts = _fetch_pending_transcripts(sb)
     if not transcripts:
-        log.info("No pending transcripts found.")
+        n_p, n_pc = _insight_queue_counts(sb)
+        message, summary = _format_idle_summary(n_p, n_pc)
+        log.info("%s\n%s", message, summary)
         return {
             "video_ids": [],
             "total_claims": 0,
             "total_new_narratives": 0,
             "stopped_early": False,
-            "reason": None,
+            "idle": True,
+            "reason": "no_queued_transcripts",
+            "message": message,
+            "summary": summary,
+            "queued_pending": n_p,
+            "queued_pending_completion": n_pc,
             "last_completed_transcript_id": None,
             "next_transcript_id": None,
             "remaining_ms": _get_remaining_ms(lambda_context),
@@ -619,6 +698,7 @@ def run_llm_insight_generation_pipeline(
                 "total_claims": total_claims,
                 "total_new_narratives": total_new_narratives,
                 "stopped_early": True,
+                "idle": False,
                 "reason": "time_budget",
                 "last_completed_transcript_id": last_completed_transcript_id,
                 "next_transcript_id": next_transcript_id,
@@ -630,14 +710,17 @@ def run_llm_insight_generation_pipeline(
         transcript_id = str(t["transcript_id"])
         text = t["cleaned_transcript_txt"]
         current_attempts = int(t.get("attempt_count") or 0)
+        entry_status = str(t.get("processing_status") or _STATUS_PENDING)
 
         try:
             _mark_transcript_in_progress(sb, transcript_id, current_attempts)
 
             claims = _extract_claims(text, prov)
             if not claims:
-                # Extraction succeeded but yielded nothing. Preserve any prior
-                # insights and mark the transcript done so we don't loop on it.
+                if entry_status == _STATUS_PENDING_COMPLETION:
+                    # Confirmed empty result on retry: clear any partial rows
+                    # left over from an earlier failed attempt before completing.
+                    _delete_existing_insights(sb, transcript_id)
                 log.info("%s: 0 claims extracted, marking done.", video_id)
                 _mark_transcript_done(sb, transcript_id)
                 processed_video_ids.append(video_id)
@@ -672,12 +755,17 @@ def run_llm_insight_generation_pipeline(
                         embedder=embedder,
                     )
 
-            # Only clear prior insights now that extraction has succeeded and
-            # we have new claims ready to persist.
+            # Extract + match succeeded. For both `pending` and `pending_completion`
+            # clear this transcript's prior claim and claim_narrative rows before
+            # persisting the fresh result. Shared `narratives` rows are not touched.
             _delete_existing_insights(sb, transcript_id)
-
             inserted = _persist_insights(
-                sb, video_id, transcript_id, claims, decisions, run_new_narratives
+                sb,
+                video_id,
+                transcript_id,
+                claims,
+                decisions,
+                run_new_narratives,
             )
             _mark_transcript_done(sb, transcript_id)
             total_claims += inserted
@@ -692,9 +780,10 @@ def run_llm_insight_generation_pipeline(
             )
         except Exception:
             log.exception("Failed to process %s", video_id)
-            # Without a dedicated `failed` state, reset to pending so the next
-            # invocation can retry rather than leaving the row stuck in-progress.
-            _reset_transcript_to_pending(sb, transcript_id)
+            # Without a dedicated `failed` state, set pending_completion so the next
+            # run will retry. Existing partial rows are intentionally left in place;
+            # the next successful attempt clears them before persisting fresh data.
+            _reset_transcript_for_retry(sb, transcript_id)
 
     remaining_ms = _get_remaining_ms(lambda_context)
     return {
@@ -702,6 +791,7 @@ def run_llm_insight_generation_pipeline(
         "total_claims": total_claims,
         "total_new_narratives": total_new_narratives,
         "stopped_early": False,
+        "idle": False,
         "reason": None,
         "last_completed_transcript_id": last_completed_transcript_id,
         "next_transcript_id": None,

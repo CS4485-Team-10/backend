@@ -1,0 +1,3 @@
+# Additive stack for sentiment_analysis and misinfo_checker only.
+torch
+transformers

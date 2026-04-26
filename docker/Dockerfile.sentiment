@@ -1,0 +1,13 @@
+FROM public.ecr.aws/lambda/python:3.12
+
+WORKDIR ${LAMBDA_TASK_ROOT}
+
+COPY docker/requirements/base.txt /tmp/base.txt
+COPY docker/requirements/sentiment-misinfo.txt /tmp/sentiment-misinfo.txt
+RUN pip install --no-cache-dir -r /tmp/base.txt -r /tmp/sentiment-misinfo.txt
+
+COPY pipelines/sentiment_analysis.py ./pipelines/
+
+RUN touch pipelines/__init__.py
+
+CMD ["pipelines.sentiment_analysis.handler"]

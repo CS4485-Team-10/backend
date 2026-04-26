@@ -1,0 +1,14 @@
+FROM public.ecr.aws/lambda/python:3.12
+
+WORKDIR ${LAMBDA_TASK_ROOT}
+
+COPY docker/requirements/base.txt /tmp/base.txt
+RUN pip install --no-cache-dir -r /tmp/base.txt
+
+COPY pipelines/llm_insight_generation.py ./pipelines/
+COPY pipelines/narrative_matching.py ./pipelines/
+COPY pipelines/shared/ ./pipelines/shared/
+
+RUN touch pipelines/__init__.py
+
+CMD ["pipelines.llm_insight_generation.handler"]

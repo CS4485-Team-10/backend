@@ -1,0 +1,8 @@
+# Shared by all pipeline Lambda images (everything except torch/transformers).
+boto3
+google-api-python-client
+numpy
+python-dotenv
+requests
+supabase
+youtube-transcript-api

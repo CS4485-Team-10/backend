@@ -1127,7 +1127,7 @@ def process_narratives_table(batch_size: int = 50):
             # Calculate narrative risk
             risk_result = _calculate_narrative_risk(claims_data)
             updates["narrative_risk_score"] = risk_result["risk_score"]
-            updates["narrative_details"] = json.dumps(risk_result["details"])
+            # updates["narrative_details"] = json.dumps(risk_result["details"])
 
             print(f"    risk_score: {risk_result['risk_score']}")
             print(f"    claims analyzed: {risk_result['details']['total_claims']}")

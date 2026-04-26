@@ -11,7 +11,7 @@ This repository contains:
 - **Pipelines** for:
   - ingesting YouTube metadata + transcripts into Supabase
   - extracting claims via an LLM provider (local Ollama by default)
-  - matching claims to narratives using embeddings (Google Gemini `embedContent`)
+  - matching claims to narratives using embeddings (AWS Bedrock Titan Text Embeddings V2)
 - **Scripts** in `scripts/` for running pipeline utilities locally.
 
 ## Tech Stack
@@ -20,7 +20,7 @@ This repository contains:
 - **DB/ORM & Migrations**: Supabase, SQLAlchemy 2.x, SQLModel, Alembic (`alembic/`)
 - **YouTube Data Ingestion**: YouTube Data API v3 + `youtube-transcript-api`
 - **LLM inference**: Switchable Ollama/Bedrock provider abstraction (env-driven)
-- **Embeddings**: Google Gemini `embedContent` (remote HTTP)
+- **Embeddings**: AWS Bedrock Titan Text Embeddings V2 (`amazon.titan-embed-text-v2:0`) via `bedrock-runtime` `invoke_model`
 - **Tooling**: Ruff (format + lint), `python-dotenv`
 
 ## Setup
@@ -61,13 +61,12 @@ Create a local `.env` (do not commit). This repo loads it via Pydantic settings 
   - `SUPABASE_SERVICE_ROLE_KEY`
   - `YOUTUBE_DATA_API_KEY` (or `YOUTUBE_API_KEY`)
 - **Required (narrative matching / embeddings)**
-  - `NARR_EMBEDDING_BACKEND=remote`
-  - `NARR_EMBEDDING_URL` (Gemini `...:embedContent`)
-  - `NARR_EMBEDDING_API_KEY`
+  - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (or `AWS_DEFAULT_REGION`)
 - **Common optional**
   - `FRONTEND_URL`, `PORT`, `ENV`
   - `LLM_PROVIDER` (default `ollama`), `LLM_MODEL`, `OLLAMA_BASE_URL`
   - `YT_QUOTA_DAILY_BUDGET_UNITS`
+  - `NARR_EMBEDDING_BACKEND=bedrock` (default), `NARR_EMBEDDING_MODEL=amazon.titan-embed-text-v2:0`, `NARR_EMBEDDING_DIMENSIONS=512`, `NARR_EMBEDDING_NORMALIZE=true`
   - `NARR_EMBEDDING_TIMEOUT`, `NARR_STRONG_MATCH`, `NARR_MULTI_LINK`, `NARR_NEW_MIN`, `NARR_MAX_PER_CLAIM`
 
 Provider notes:
@@ -78,7 +77,10 @@ Provider notes:
 Google Console:
 
 - **YouTube**: enable *YouTube Data API v3* → create API key → set `YOUTUBE_DATA_API_KEY`
-- **Gemini**: create Gemini/Google AI API key → set `NARR_EMBEDDING_API_KEY` (+ `NARR_EMBEDDING_URL`)
+
+AWS Console:
+
+- **Bedrock embeddings**: in your `AWS_REGION`, request access to `amazon.titan-embed-text-v2:0` in the Bedrock model catalog and ensure your IAM principal has `bedrock:InvokeModel` for that model
 
 ### Database migrations (Alembic)
 
@@ -133,7 +135,7 @@ LLM_PROVIDER=bedrock LLM_MODEL=gemma2 python -m pipelines.yt_data_ingestion
 python -m pipelines.llm_insight_generation
 ```
 
-This reads Supabase transcripts that don’t yet have claims, extracts generalizable health-related claims, matches them to existing narratives via embeddings (Gemini), creates new narratives when needed, and writes back to Supabase (`claims`, `narratives`, `claim_narratives`).
+This reads Supabase transcripts that don’t yet have claims, extracts generalizable health-related claims, matches them to existing narratives via embeddings (AWS Bedrock Titan Text Embeddings V2), creates new narratives when needed, and writes back to Supabase (`claims`, `narratives`, `claim_narratives`).
 
 ## Architecture
 
@@ -155,7 +157,7 @@ Standalone pipeline modules (typically run via `python -m ...`):
 
 - `**pipelines/yt_data_ingestion.py**`: YouTube search + semantic filter + impact filter + persist to Supabase
 - `**pipelines/llm_insight_generation.py**`: claim extraction + narrative creation/linking + persist to Supabase
-- `**pipelines/narrative_matching.py**`: embedding + cosine similarity matching logic (Gemini `embedContent`)
+- `**pipelines/narrative_matching.py**`: embedding + cosine similarity matching logic (AWS Bedrock Titan Text Embeddings V2 via `invoke_model`)
 - `**pipelines/shared/**`: shared pipeline utilities / interfaces
 
 ### `alembic/` (migrations)
