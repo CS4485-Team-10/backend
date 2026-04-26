@@ -2,6 +2,7 @@ from app.models.claim import Claim
 from app.models.claim_narrative import ClaimNarrative
 from app.models.email_subscriber import EmailSubscriber
 from app.models.narrative import Narrative
+from app.models.notification_log import NotificationLog
 from app.models.transcript import Transcript
 from app.models.video import Video
 
@@ -12,4 +13,5 @@ __all__ = [
     "Narrative",
     "ClaimNarrative",
     "EmailSubscriber",
+    "NotificationLog",
 ]

@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = ""
     LLM_MODEL: str = ""
 
+    BREVO_API_KEY: str = ""
+    ALERT_SENDER_EMAIL: str = "noreply@yourdomain.com"
+    ALERT_SENDER_NAME: str = "YouTube Intelligence"
+
     @property
     def youtube_api_key(self) -> str:
         return self.YOUTUBE_API_KEY or self.YOUTUBE_DATA_API_KEY
