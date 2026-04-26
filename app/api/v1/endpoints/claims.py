@@ -102,7 +102,7 @@ def list_claims(
     verified = session.exec(
         select(func.count())
         .select_from(Claim)
-        .where(col(Claim.fact_check_status).ilike("verified"))
+        .where(col(Claim.fact_check_status).ilike("verified%"))
     ).one()
     disputed = session.exec(
         select(func.count())
