@@ -1151,7 +1151,40 @@ def process_narratives_table(batch_size: int = 9999, force_reprocess: bool = Fal
             print(f"    risk_score: {risk_result['risk_score']}")
             print(f"    claims analyzed: {risk_result['details']['total_claims']}")
         else:
+            # No claims linked - evaluate the narrative text itself
             print("    No claims linked to this narrative")
+            print("    Evaluating narrative text directly...")
+
+            entailment_label, entailment_conf = check_entailment(narrative_text)
+
+            # Map entailment to risk score
+            if entailment_label == "refuted" and entailment_conf >= 0.75:
+                risk_score = 3.0  # High risk - strongly contradicts medical science
+            elif entailment_label == "refuted" and entailment_conf >= 0.65:
+                risk_score = 2.5  # Medium-high risk
+            elif entailment_label == "refuted":
+                risk_score = 2.0  # Medium risk - contradicts but low confidence
+            else:
+                risk_score = 1.0  # Low risk - supported or neutral
+
+            updates["narrative_risk_score"] = risk_score
+            updates["narrative_details"] = json.dumps(
+                {
+                    "total_claims": 0,
+                    "high_risk_claims": 0,
+                    "medium_risk_claims": 0,
+                    "low_risk_claims": 0,
+                    "avg_sentiment": 0.0,
+                    "verified_false_count": 0,
+                    "entailment_label": entailment_label,
+                    "entailment_confidence": entailment_conf,
+                    "source": "narrative_text_evaluation",
+                }
+            )
+            print(
+                f"    entailment: {entailment_label} (confidence: {entailment_conf:.4f})"
+            )
+            print(f"    risk_score: {risk_score} (from narrative text)")
 
         # Update narrative
         if updates:
