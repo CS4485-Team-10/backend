@@ -606,7 +606,7 @@ def _calculate_claim_risk_level(
     return "low"
 
 
-def process_claims_table(batch_size: int = 50, force_reprocess: bool = False):
+def process_claims_table(batch_size: int = 450, force_reprocess: bool = False):
     """
     Process claims in the Supabase claims table, enriching null fields.
 
@@ -915,13 +915,14 @@ def handler(event, context):
     AWS Lambda entrypoint for misinformation checks.
 
     `event` may provide:
-      - action: "videos" (default) or "claims_batch"
+      - action: "videos" (default), "claims_batch", or "narratives_batch"
       - video_ids: explicit list of IDs (for action == "videos")
       - mode: None | "1" | "2" | "3" (mirrors CLI modes) for videos
       - ids_file: path used with mode "1"
       - write_json: bool
       - json_path: output path for JSON
-      - batch_size: int (for action == "claims_batch")
+      - batch_size: int (for action == "claims_batch" or "narratives_batch")
+      - force_reprocess: bool (for "claims_batch" or "narratives_batch")
     """
     del context  # unused
 
@@ -932,9 +933,26 @@ def handler(event, context):
     action = event.get("action", "videos")
 
     if action == "claims_batch":
-        batch_size = int(event.get("batch_size", 50))
-        process_claims_table(batch_size=batch_size)
-        return {"ok": True, "action": "claims_batch", "batch_size": batch_size}
+        batch_size = int(event.get("batch_size", 450))
+        force_reprocess = bool(event.get("force_reprocess", False))
+        process_claims_table(batch_size=batch_size, force_reprocess=force_reprocess)
+        return {
+            "ok": True,
+            "action": "claims_batch",
+            "batch_size": batch_size,
+            "force_reprocess": force_reprocess,
+        }
+
+    if action == "narratives_batch":
+        batch_size = int(event.get("batch_size", 9999))
+        force_reprocess = bool(event.get("force_reprocess", False))
+        process_narratives_table(batch_size=batch_size, force_reprocess=force_reprocess)
+        return {
+            "ok": True,
+            "action": "narratives_batch",
+            "batch_size": batch_size,
+            "force_reprocess": force_reprocess,
+        }
 
     write_json = bool(event.get("write_json", False))
     json_path = event.get("json_path", "misinfo_report.json")
@@ -1147,7 +1165,7 @@ def process_narratives_table(batch_size: int = 9999, force_reprocess: bool = Fal
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "4":
-        batch = 50
+        batch = 450
         force = False
         if "--batch" in sys.argv:
             idx = sys.argv.index("--batch")
