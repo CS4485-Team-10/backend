@@ -1066,10 +1066,12 @@ def process_narratives_table(batch_size: int = 9999, force_reprocess: bool = Fal
     query = client.table("narratives").select(
         "narrative_id, narrative_label, narrative_description, narrative_category"
     )
-    
+
     if not force_reprocess:
-        query = query.or_("narrative_category.eq.Uncategorized,narrative_risk_score.eq.5.0")
-    
+        query = query.or_(
+            "narrative_category.eq.Uncategorized,narrative_risk_score.eq.5.0"
+        )
+
     resp = query.limit(batch_size).execute()
 
     rows = resp.data
