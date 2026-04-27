@@ -1058,20 +1058,21 @@ def _calculate_narrative_risk(claims_data: list[dict]) -> dict:
     }
 
 
-def process_narratives_table(batch_size: int = 50):
+def process_narratives_table(batch_size: int = 9999, force_reprocess: bool = False):
     """Enrich narratives with category and risk score based on associated claims."""
     client = get_supabase_client()
 
     # Get narratives that need enrichment (category is "Uncategorized" or risk is 5.0)
-    resp = (
-        client.table("narratives")
-        .select(
-            "narrative_id, narrative_label, narrative_description, narrative_category"
-        )
-        .or_("narrative_category.eq.Uncategorized,narrative_risk_score.eq.5.0")
-        .limit(batch_size)
-        .execute()
+    query = client.table("narratives").select(
+        "narrative_id, narrative_label, narrative_description, narrative_category"
     )
+
+    if not force_reprocess:
+        query = query.or_(
+            "narrative_category.eq.Uncategorized,narrative_risk_score.eq.5.0"
+        )
+
+    resp = query.limit(batch_size).execute()
 
     rows = resp.data
     if not rows:
@@ -1161,12 +1162,13 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if len(sys.argv) > 1 and sys.argv[1] == "5":
-        batch = 50
+        batch = 9999
         if "--batch" in sys.argv:
             idx = sys.argv.index("--batch")
             if idx + 1 < len(sys.argv):
                 batch = int(sys.argv[idx + 1])
-        process_narratives_table(batch_size=batch)
+        force = "--force" in sys.argv
+        process_narratives_table(batch_size=batch, force_reprocess=force)
         sys.exit(0)
 
     write_json = "--json" in sys.argv
