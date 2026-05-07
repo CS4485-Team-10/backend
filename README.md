@@ -1,33 +1,43 @@
 # YouTube Intelligence Platform — Backend
 
-Backend services and pipelines for ingesting YouTube content, extracting health-related claims, matching them into narratives, and serving data via a FastAPI API.
+Backend for the **YouTube Intelligence Platform**: it ingests YouTube data, extracts health-related claims with an LLM, groups claims into narratives, and exposes the results through a versioned REST API.
 
-## Overview
+## What This Backend Does
 
-This repository contains:
+- Pulls YouTube metadata and transcripts into Supabase
+- Filters and prioritizes content for public-health relevance (including semantic filtering and impact-style signals in batch flows).
+- Uses an LLM to extract generalizable **health-related claims** from transcripts.
+- Matches claims to **narratives** using embeddings and creates new narratives when needed.
+- Serves **versioned API endpoints** (`/api/v1/...`) so clients can query health, overview, claims, narratives, ingestion, and related resources.
 
-- **FastAPI service** under `app/` with versioned REST endpoints (`/api/v1/...`).
-- **Database models + migrations** (SQLModel/SQLAlchemy + Alembic) for the core analytics schema.
-- **Pipelines** for:
-  - ingesting YouTube metadata + transcripts into Supabase
-  - extracting claims via an LLM provider (local Ollama by default)
-  - matching claims to narratives using embeddings (AWS Bedrock Titan Text Embeddings V2)
-- **Scripts** in `scripts/` for running pipeline utilities locally.
+## Architecture Overview
+
+Requests hit a **FastAPI** service. It reads and writes from **Supabase** via SQLModel/SQLAlchemy. **Ingestion pipelines** fetch YouTube data (Data API + transcripts) and upsert into core tables. A separate **LLM pipeline** extracts claims and runs **narrative matching** (embedding similarity, backed by Amazon Bedrock Titan embeddings in the default setup). **Deployment** can be configured via`render.yaml`.
 
 ## Tech Stack
 
-- **API**: FastAPI + Uvicorn
-- **DB/ORM & Migrations**: Supabase, SQLAlchemy 2.x, SQLModel, Alembic (`alembic/`)
-- **YouTube Data Ingestion**: YouTube Data API v3 + `youtube-transcript-api`
-- **LLM inference**: Switchable Ollama/Bedrock provider abstraction (env-driven)
-- **Embeddings**: AWS Bedrock Titan Text Embeddings V2 (`amazon.titan-embed-text-v2:0`) via `bedrock-runtime` `invoke_model`
-- **Tooling**: Ruff (format + lint), `python-dotenv`
 
-## Setup
+| Area                         | Technologies                                                                                                    |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| API & runtime                | FastAPI, Uvicorn                                                                                                |
+| DB & Schema                  | Supabase (Postgres), SQLAlchemy 2.x, SQLModel                                                                   |
+| Migrations                   | Alembic (`alembic/`)                                                                                            |
+| YouTube Data Ingestion       | YouTube Data API v3, `youtube-transcript-api`                                                                   |
+| Large Language Models (LLMs) | Switchable **Ollama / Amazon Bedrock** (environment-driven)                                                     |
+| Narrative Embeddings         | Amazon Bedrock - Titan Text Embeddings V2 (`amazon.titan-embed-text-v2:0`) via `bedrock-runtime` `invoke_model` |
+| Quality of life              | Ruff (format + lint), `python-dotenv`, Pydantic settings                                                        |
 
-### Python environment (venv)
 
-From `backend/`:
+## Repository Structure
+
+- `**app/`** — The live API: routers under `/api/v1`, configuration, database sessions, SQLModel tables, and request/response schemas. Pipeline helpers used by HTTP endpoints (for example, single-video ingest) live here under `app/pipelines/`.
+- `pipelines/` — Batch jobs you run locally or can be configured to run async via AWS Lambda: YouTube search + filtering + persistence, LLM claim extraction and narrative linking, embedding-based matching helpers, and shared pipeline utilities.
+- `**alembic/`** — Database migrations (`versions/`) and Alembic runtime configuration (`env.py`).
+- `**scripts/**` — Developer utilities (for example, git hook setup and local orchestration scripts).
+
+## Installation & Setup
+
+From `backend/`, create a virtual environment and install dependencies:
 
 ```bash
 python -m venv .venv
@@ -35,91 +45,48 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Optional dev tooling (Ruff + hooks):
+Optional formatting, linting, and pre-commit hooks:
 
 ```bash
 pip install -r requirements-dev.txt
 bash scripts/setup-hooks.sh
 ```
 
-### Ruff (format + lint)
+Format and lint with Ruff:
 
 ```bash
 ruff format .
 ruff check .
 ```
 
-If you ran `scripts/setup-hooks.sh`, Ruff also runs automatically on staged files via the pre-commit hook.
+If you ran `scripts/setup-hooks.sh`, Ruff also runs on staged files via the pre-commit hook.
 
-### Environment variables (`.env`)
+## Running the Project
 
-Create a local `.env` (do not commit). This repo loads it via Pydantic settings and `python-dotenv`.
-
-- **Required (local dev)**
-  - `DATABASE_URL`
-  - `SUPABASE_URL`
-  - `SUPABASE_SERVICE_ROLE_KEY`
-  - `YOUTUBE_DATA_API_KEY` (or `YOUTUBE_API_KEY`)
-- **Required (narrative matching / embeddings)**
-  - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (or `AWS_DEFAULT_REGION`)
-- **Common optional**
-  - `FRONTEND_URL`, `PORT`, `ENV`
-  - `LLM_PROVIDER` (default `ollama`), `LLM_MODEL`, `OLLAMA_BASE_URL`
-  - `YT_QUOTA_DAILY_BUDGET_UNITS`
-  - `NARR_EMBEDDING_BACKEND=bedrock` (default), `NARR_EMBEDDING_MODEL=amazon.titan-embed-text-v2:0`, `NARR_EMBEDDING_DIMENSIONS=512`, `NARR_EMBEDDING_NORMALIZE=true`
-  - `NARR_EMBEDDING_TIMEOUT`, `NARR_STRONG_MATCH`, `NARR_MULTI_LINK`, `NARR_NEW_MIN`, `NARR_MAX_PER_CLAIM`
-
-Provider notes:
-
-- `pipelines/yt_data_ingestion.py` semantic filtering now uses `LLM_PROVIDER` + `LLM_MODEL` as its switch mechanism (`ollama` or `bedrock`), with ingestion default model `gemma2` when `LLM_MODEL` is unset.
-- `pipelines/llm_insight_generation.py` uses the same provider variables, with default model `qwen3` when `LLM_MODEL` is unset.
-
-Google Console:
-
-- **YouTube**: enable *YouTube Data API v3* → create API key → set `YOUTUBE_DATA_API_KEY`
-
-AWS Console:
-
-- **Bedrock embeddings**: in your `AWS_REGION`, request access to `amazon.titan-embed-text-v2:0` in the Bedrock model catalog and ensure your IAM principal has `bedrock:InvokeModel` for that model
-
-### Database migrations (Alembic)
-
-Migrations live in `alembic/versions/`. Alembic reads the DB URL from `DATABASE_URL` (wired in `alembic/env.py`; `alembic.ini` is intentionally URL-less).
-
-```bash
-alembic upgrade head
-alembic current
-alembic revision --autogenerate -m "describe your change"
-```
-
-## Running
-
-### Run the API server
+**API server** — Starts the FastAPI app with auto-reload for local development:
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
-Health check:
+Health check: `GET /api/v1/health`
 
-- `GET /api/v1/health`
+---
 
-### Run pipelines locally
+**Ingest a single video (via API)** — Fetches video, channel, and transcript data and upserts into Supabase (`channels`, `videos`, `transcripts`):
 
-#### Ingest a single video (API route)
+- `POST /api/v1/ingest/video` with JSON `{ "video_id": "<id>" }`  
+(Implementation uses `app/pipelines/yt_ingest.py`.)
 
-- `POST /api/v1/ingest/video` with JSON `{ "video_id": "<id>" }`
-  - Uses `app/pipelines/yt_ingest.py` to fetch video/channel/transcript and upserts to Supabase tables (`channels`, `videos`, `transcripts`).
+---
 
-#### Batch ingest + filter (script entrypoint)
+**Batch ingest + filter** — Searches YouTube, applies an LLM semantic filter for public-health relevance, applies impact-style filtering, and persists videos and transcripts to Supabase:
 
 ```bash
 python -m pipelines.yt_data_ingestion
 ```
 
-This pipeline searches YouTube, applies an LLM semantic filter (public-health relevance), filters by impact metrics, and persists `videos` + `transcripts` to Supabase.
-
-Example provider switching:
+Example provider overrides:
 
 ```bash
 # local test
@@ -129,52 +96,109 @@ LLM_PROVIDER=ollama LLM_MODEL=gemma2 python -m pipelines.yt_data_ingestion
 LLM_PROVIDER=bedrock LLM_MODEL=gemma2 python -m pipelines.yt_data_ingestion
 ```
 
-#### LLM insight generation (claims + narratives)
+---
+
+**Claims + narratives (LLM insight generation)** — Reads transcripts without claims yet, extracts health-related claims, matches them to narratives with embeddings (default: Amazon Bedrock Titan Text Embeddings V2), opens new narratives when appropriate, and writes `claims`, `narratives`, and `claim_narratives`:
 
 ```bash
 python -m pipelines.llm_insight_generation
 ```
 
-This reads Supabase transcripts that don’t yet have claims, extracts generalizable health-related claims, matches them to existing narratives via embeddings (AWS Bedrock Titan Text Embeddings V2), creates new narratives when needed, and writes back to Supabase (`claims`, `narratives`, `claim_narratives`).
+## Environment Variables
 
-## Architecture
+Create a local `.env` (never commit it). The app loads it through Pydantic settings and `python-dotenv`.
 
-### `app/` (FastAPI application)
+**Required for typical local development**
 
-- `**app/main.py**`: FastAPI app, CORS, router mounting at `/api/v1`
-- `**app/api/**`: versioned API routes
-  - `app/api/v1/endpoints/`: endpoints such as `health`, `overview`, `claims`, `narratives`, `ingest`, etc.
-- `**app/core/**`: application config and infrastructure
-  - `app/core/config.py`: Pydantic settings; loads `.env`
-  - `app/core/database.py`: DB session wiring (used by API endpoints)
-- `**app/models/**`: SQLModel models representing DB tables (videos, claims, narratives, join tables, etc.)
-- `**app/schemas/**`: Pydantic response/request schemas for API responses
-- `**app/pipelines/**`: API-facing pipeline helpers (e.g. `yt_ingest.py` used by `/ingest/video`)
 
-### `pipelines/` (batch + ML/LLM pipelines)
+| Variable                                    | Purpose                                  |
+| ------------------------------------------- | ---------------------------------------- |
+| `DATABASE_URL`                              | Postgres connection for SQLModel/Alembic |
+| `SUPABASE_URL`                              | Supabase project URL                     |
+| `SUPABASE_SERVICE_ROLE_KEY`                 | Service role access for Supabase         |
+| `YOUTUBE_DATA_API_KEY` or `YOUTUBE_API_KEY` | YouTube Data API v3                      |
 
-Standalone pipeline modules (typically run via `python -m ...`):
 
-- `**pipelines/yt_data_ingestion.py**`: YouTube search + semantic filter + impact filter + persist to Supabase
-- `**pipelines/llm_insight_generation.py**`: claim extraction + narrative creation/linking + persist to Supabase
-- `**pipelines/narrative_matching.py**`: embedding + cosine similarity matching logic (AWS Bedrock Titan Text Embeddings V2 via `invoke_model`)
-- `**pipelines/shared/**`: shared pipeline utilities / interfaces
+**Required for narrative matching / embeddings (default Bedrock path)**
 
-### `alembic/` (migrations)
 
-- `**alembic/env.py**`: migration runtime config (loads `DATABASE_URL`)
-- `**alembic/versions/**`: migration revisions
+| Variable                                     | Purpose                  |
+| -------------------------------------------- | ------------------------ |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | AWS credentials          |
+| `AWS_REGION` or `AWS_DEFAULT_REGION`         | Region for Bedrock calls |
 
-### `scripts/` (developer utilities)
 
-Convenience scripts for running parts of the pipeline locally:
+**Common optional**
 
-- `scripts/run_pipeline.py`: runs selected pipeline scripts
-- `scripts/setup-hooks.sh`: installs dev deps + enables git hooks
-- Other one-off analysis scripts (`sentiment_analysis.py`, `misinfo_checker.py`, etc.)
 
-## Deployment notes
+| Variable                                                                                               | Notes                                  |
+| ------------------------------------------------------------------------------------------------------ | -------------------------------------- |
+| `FRONTEND_URL`, `PORT`, `ENV`                                                                          | App/runtime tuning                     |
+| `LLM_PROVIDER`                                                                                         | Default `ollama`; switch with env      |
+| `LLM_MODEL`, `OLLAMA_BASE_URL`                                                                         | Model and Ollama endpoint              |
+| `YT_QUOTA_DAILY_BUDGET_UNITS`                                                                          | Caps YouTube quota usage               |
+| `NARR_EMBEDDING_BACKEND`                                                                               | Default `bedrock`                      |
+| `NARR_EMBEDDING_MODEL`                                                                                 | Default `amazon.titan-embed-text-v2:0` |
+| `NARR_EMBEDDING_DIMENSIONS`                                                                            | Default `512`                          |
+| `NARR_EMBEDDING_NORMALIZE`                                                                             | Default `true`                         |
+| `NARR_EMBEDDING_TIMEOUT`, `NARR_STRONG_MATCH`, `NARR_MULTI_LINK`, `NARR_NEW_MIN`, `NARR_MAX_PER_CLAIM` | Matching tuning knobs                  |
 
-- `render.yaml` contains a basic Render configuration for running the FastAPI service.
-- Ensure all required secrets are configured as environment variables in the deployment environment (do not rely on a checked-in `.env`).
+
+
+
+## Deployment Notes
+
+- `render.yaml` defines a basic Render deployment for the FastAPI service
+
+
+
+## Developer Notes
+
+### LLM Provider Mechanisms
+
+- `pipelines/yt_data_ingestion.py` uses `LLM_PROVIDER` + `LLM_MODEL` (`ollama` or `bedrock`). If `LLM_MODEL` is unset, ingestion defaults to `gemma2`.
+- `pipelines/llm_insight_generation.py` uses the same variables; if `LLM_MODEL` is unset, it defaults to `qwen3`.
+
+### Cloud Console Credentials
+
+- **Google Cloud**: enable *YouTube Data API v3*, create an API key, set `YOUTUBE_DATA_API_KEY`.
+- **AWS**: in your chosen region, request access to `amazon.titan-embed-text-v2:0` in the Bedrock model catalog and ensure the IAM principal can `bedrock:InvokeModel` for that model.
+
+### DB Migrations
+
+- Migrations live in `alembic/versions/`. Alembic reads `DATABASE_URL` from `alembic/env.py`; `alembic.ini` intentionally omits the URL.
+
+```bash
+alembic upgrade head
+alembic current
+alembic revision --autogenerate -m "describe your change"
+```
+
+
+
+
+
+### API Layouts (`app/`)
+
+For contributors who want a quick map of the API package:
+
+- `app/main.py` — FastAPI app, CORS, routers mounted at `/api/v1`
+- `app/api/v1/endpoints/` — Endpoints such as health, overview, claims, narratives, ingest, etc.
+- `app/core/config.py` — Settings + `.env` loading
+- `app/core/database.py` — Database sessions for routes
+- `app/models/` — SQLModel models (videos, claims, narratives, joins, etc.)
+- `app/schemas/` — Pydantic request/response shapes
+
+### Data Pipeline Layouts (`pipelines/`)
+
+- `pipelines/yt_data_ingestion.py` — Search + semantic filter + impact filter + transcript extraction
+- `pipelines/llm_insight_generation.py` — Claims, narratives extraction
+- `pipelines/narrative_matching.py` — Embedding + cosine similarity (Bedrock Titan Text Embeddings V2 via `invoke_model`)
+- `pipelines/shared/` — Shared helpers, interfaces and dataclasses
+
+
+
+### Related Repositories
+
+- [YouTube Intelligence Platform — Frontend](https://github.com/CS4485-Team-10/frontend)
 
