@@ -30,10 +30,10 @@ Requests hit a **FastAPI** service. It reads and writes from **Supabase** via SQ
 
 ## Repository Structure
 
-- `**app/`** — The live API: routers under `/api/v1`, configuration, database sessions, SQLModel tables, and request/response schemas. Pipeline helpers used by HTTP endpoints (for example, single-video ingest) live here under `app/pipelines/`.
+- `app/` — The live API: routers under `/api/v1`, configuration, database sessions, SQLModel tables, and request/response schemas. Pipeline helpers used by HTTP endpoints (for example, single-video ingest) live here under `app/pipelines/`.
 - `pipelines/` — Batch jobs you run locally or can be configured to run async via AWS Lambda: YouTube search + filtering + persistence, LLM claim extraction and narrative linking, embedding-based matching helpers, and shared pipeline utilities.
-- `**alembic/`** — Database migrations (`versions/`) and Alembic runtime configuration (`env.py`).
-- `**scripts/**` — Developer utilities (for example, git hook setup and local orchestration scripts).
+- `alembic/` — Database migrations (`versions/`) and Alembic runtime configuration (`env.py`).
+- `scripts/` — Developer utilities (for example, git hook setup and local orchestration scripts).
 
 ## Installation & Setup
 
